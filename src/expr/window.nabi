@@ -1,0 +1,161 @@
+// Cumulative and rolling-window statistics, one pass each.
+
+use pkg::column::Data;
+use pkg::column::bitmap::Bitmap;
+use pkg::expr::{Cum, Roll};
+use pkg::{Column, TableError};
+
+/// Running `op` down `c`; a null row stays null and leaves the total.
+pub(pkg) fn cumulative(op: Cum, c: Column) throws (TableError) -> Column {
+    let n = c.len();
+    if op == Cum::Count {
+        let out: List<i64> = List::with_capacity(n);
+        let k: i64 = 0;
+        for i in 0..n {
+            if c.is_valid(i) { k += 1; }
+            out.push(k);
+        }
+        return Column::of(Data::I64(out));
+    }
+    if let Data::I64(a) = c.data {
+        if op != Cum::Prod {
+            let out: List<i64> = List::with_capacity(n);
+            let acc: i64 = 0;
+            let started = false;
+            for i in 0..n {
+                if c.is_valid(i) {
+                    let x = a[i];
+                    acc = if !started { x } else {
+                        match op {
+                            Cum::Sum => acc.wrapping_add(x),
+                            Cum::Min => acc.min(x),
+                            _ => acc.max(x),
+                        }
+                    };
+                    started = true;
+                }
+                out.push(acc);
+            }
+            return Column::with_opt(Data::I64(out), c.valid);
+        }
+    }
+    let xs = try c.f64_list() catch _ { throw TableError::invalid(f"cumulative ops need numbers, not {c.dtype()}"); };
+    let out: List<f64> = List::with_capacity(n);
+    // Neumaier compensation keeps a long running sum accurate.
+    let acc = 0.0;
+    let comp = 0.0;
+    let started = false;
+    for i in 0..n {
+        if c.is_valid(i) {
+            let x = xs[i];
+            if !started {
+                acc = x;
+                started = true;
+            } else {
+                match op {
+                    Cum::Sum => {
+                        let s = acc + x;
+                        comp += if acc.abs() >= x.abs() { (acc - s) + x } else { (x - s) + acc };
+                        acc = s;
+                    },
+                    Cum::Prod => { acc *= x; },
+                    Cum::Min => { acc = if x < acc || x.is_nan() { x } else { acc }; },
+                    _ => { acc = if x > acc || x.is_nan() { x } else { acc }; },
+                }
+            }
+        }
+        out.push(acc + comp);
+    }
+    Column::with_opt(Data::F64(out), c.valid)
+}
+
+/// `op` over the last `w` rows; null until `minp` non-null values are
+/// in the window. Sums use a compensated add / remove; min and max a
+/// monotonic deque of positions; std a Welford update with removal.
+pub(pkg) fn rolling(op: Roll, w: usize, minp: usize, c: Column) throws (TableError) -> Column {
+    if w == 0 {
+        throw TableError::invalid("a rolling window needs at least one row; pass `window >= 1`");
+    }
+    let n = c.len();
+    let xs = try c.f64_list() catch _ { throw TableError::invalid(f"rolling windows need numbers, not {c.dtype()}"); };
+    let out: List<f64> = List::filled(n, 0.0);
+    let ok: List<bool> = List::filled(n, false);
+    if op == Roll::Min || op == Roll::Max {
+        let dq: List<usize> = List::with_capacity(w);
+        let head: usize = 0;
+        let cnt: usize = 0;
+        for i in 0..n {
+            if c.is_valid(i) {
+                let x = xs[i];
+                while dq.len() > head {
+                    let y = xs[dq[dq.len() - 1]];
+                    if (op == Roll::Min && y >= x) || (op == Roll::Max && y <= x) {
+                        _ = dq.pop();
+                    } else {
+                        break;
+                    }
+                }
+                dq.push(i);
+                cnt += 1;
+            }
+            if i >= w {
+                if c.is_valid(i - w) { cnt -= 1; }
+                while dq.len() > head && dq[head] + w <= i {
+                    head += 1;
+                }
+            }
+            if cnt >= minp && dq.len() > head {
+                out[i] = xs[dq[head]];
+                ok[i] = true;
+            }
+            // Compact the dead front now and then.
+            if head > 1024 && head * 2 > dq.len() {
+                dq = dq[head:].to_list();
+                head = 0;
+            }
+        }
+    } else {
+        let sum = 0.0;
+        let comp = 0.0;
+        let mean = 0.0;
+        let m2 = 0.0;
+        let cnt: usize = 0;
+        for i in 0..n {
+            if c.is_valid(i) {
+                let x = xs[i];
+                let s = sum + x;
+                comp += if sum.abs() >= x.abs() { (sum - s) + x } else { (x - s) + sum };
+                sum = s;
+                cnt += 1;
+                let d = x - mean;
+                mean += d / cnt as f64;
+                m2 += d * (x - mean);
+            }
+            if i >= w && c.is_valid(i - w) {
+                let x = xs[i - w];
+                let s = sum - x;
+                comp += if sum.abs() >= x.abs() { (sum - s) - x } else { (-x - s) + sum };
+                sum = s;
+                cnt -= 1;
+                if cnt == 0 {
+                    mean = 0.0;
+                    m2 = 0.0;
+                } else {
+                    let d = x - mean;
+                    mean -= d / cnt as f64;
+                    m2 -= d * (x - mean);
+                }
+            }
+            if cnt >= minp && cnt > 0 {
+                let total = sum + comp;
+                out[i] = match op {
+                    Roll::Sum => total,
+                    Roll::Mean => total / cnt as f64,
+                    _ => if cnt < 2 { f64::NAN } else { (m2.max(0.0) / (cnt - 1) as f64).sqrt() },
+                };
+                ok[i] = true;
+            }
+        }
+    }
+    Column::with_valid(Data::F64(out), Bitmap::from_flags(ok))
+}

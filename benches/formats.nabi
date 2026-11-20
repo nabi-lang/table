@@ -1,0 +1,74 @@
+// Arrow IPC and Parquet on a 1e6-row table (an id, a float with nulls,
+// a 37-value string, a date per row); lazy against eager on a filtered
+// group-by over a Parquet file.
+
+use pkg::{Arrow, Column, Compression, Parquet, Table, col, mean};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::{env, fs};
+
+const N: usize = 1000000;
+
+fn data() -> Table {
+    // Built outside the list literal: a literal of calls with constant
+    // arguments is evaluated at compile time and runs out of steps.
+    let id = Column::from(List::from_fn(N, |i| i as i64));
+    let price = Column::from(List::from_fn(N, |i| -> f64 | none { if i % 50 == 0 { none } else { (i % 1000) as f64 * 0.25 } }));
+    let tag = Column::from(List::from_fn(N, |i| f"tag{i % 37}"));
+    let day = Column::dates(List::from_fn(N, |i| pkg::Date { days: 19000 + (i % 365) as i32 }));
+    try! Table::from_columns([("id", id), ("price", price), ("tag", tag), ("day", day)])
+}
+
+#[bench]
+fn arrow_write(b: Bench) {
+    let t = data();
+    b.iter(|| Arrow::new().write_bytes(black_box(t)));
+}
+
+#[bench]
+fn arrow_read(b: Bench) {
+    let bytes = Arrow::new().write_bytes(data());
+    b.set_bytes(bytes.len() as i64);
+    b.iter(|| try! Arrow::new().read_bytes(black_box(bytes)));
+}
+
+#[bench]
+fn parquet_write_snappy(b: Bench) {
+    let t = data();
+    b.iter(|| Parquet::new().write_bytes(black_box(t)));
+}
+
+#[bench]
+fn parquet_write_plain(b: Bench) {
+    let t = data();
+    b.iter(|| Parquet::new().compression(Compression::None).write_bytes(black_box(t)));
+}
+
+#[bench]
+fn parquet_read_snappy(b: Bench) {
+    let bytes = Parquet::new().write_bytes(data());
+    b.set_bytes(bytes.len() as i64);
+    b.iter(|| try! Parquet::new().read_bytes(black_box(bytes)));
+}
+
+fn file() -> str {
+    let p = f"{env::temp_dir()}/table-bench.parquet";
+    if !fs::exists(p) { try! Parquet::new().row_group_rows(65536).write_file(data(), p); }
+    p
+}
+
+#[bench]
+fn query_eager(b: Bench) {
+    let p = file();
+    b.iter(|| {
+        let t = try! pkg::read_parquet(black_box(p));
+        let f = try! t.filter(col("id") .< 100000);
+        try! (try! f.group_by(["tag"])).agg([mean("price")])
+    });
+}
+
+#[bench]
+fn query_lazy(b: Bench) {
+    let p = file();
+    b.iter(|| try! pkg::scan_parquet(black_box(p)).filter(col("id") .< 100000).group_by(["tag"]).agg([mean("price")]).collect());
+}

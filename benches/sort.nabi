@@ -1,0 +1,25 @@
+// Sort 1e7 rows by an f64 key, and by two keys.
+
+use pkg::{Column, Table, asc, desc};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn data(n: usize) -> Table {
+    let rng = Xoshiro256PlusPlus::seed(3u64);
+    let x: List<f64> = List::from_fn(n, [ref rng] |_| rng.f64() * 1000.0 - 500.0);
+    let g: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(100u64) as i64);
+    try Table::from_columns([("x", Column::from(x)), ("g", Column::from(g))]) catch e { panic(f"{e}"); }
+}
+
+#[bench]
+fn argsort_1e7_f64(b: Bench) {
+    let t = data(10000000);
+    b.iter(|| try black_box(t).argsort([asc("x")]) catch e { panic(f"{e}"); });
+}
+
+#[bench]
+fn sort_1e7_two_keys(b: Bench) {
+    let t = data(10000000);
+    b.iter(|| try black_box(t).sort([asc("g"), desc("x")]) catch e { panic(f"{e}"); });
+}

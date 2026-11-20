@@ -1,0 +1,110 @@
+// Sorting: stability, multi-key, direction, nulls, every type, and a
+// comparison sort on random data.
+
+use pkg::{Column, Table, Value, asc, desc};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn ints(t: Table, k: usize) -> List<i64 | none> { t.column_at(k).to_options_i64() }
+
+#[test]
+fn single_keys() {
+    let t = pkg::table!{ "x": [3, -1, 2, -7, 0], "f": [0.5, -0.0, f64::NAN, -2.5, 0.0], "s": ["b", "B", "a", "ab", ""] };
+    assert(ints(try t.sort([asc("x")]) catch _ { t }, 0) == [-7, -1, 0, 2, 3]);
+    assert(ints(try t.sort([desc("x")]) catch _ { t }, 0) == [3, 2, 0, -1, -7]);
+    let f = (try t.sort([asc("f")]) catch _ { t }).column_at(1).to_options_f64();
+    assert(f[0] == -2.5 && f[3] == 0.5 && (f[4] ?? 0.0).is_nan());
+    let s = (try t.sort([asc("s")]) catch _ { t }).column_at(2).to_options_str();
+    assert(s == ["", "B", "a", "ab", "b"]);
+    assert(ints(try t.sort_by(["s"]) catch _ { t }, 0) == [0, -1, 2, -7, 3]);
+}
+
+#[test]
+fn stable_multi_key() {
+    let t = pkg::table!{ "g": ["b", "a", "b", "a", "b"], "x": [1, 2, 1, 1, 0], "id": [0, 1, 2, 3, 4] };
+    let s = try t.sort([asc("g"), desc("x")]) catch _ { t };
+    assert(ints(s, 2) == [1, 3, 0, 2, 4]);
+    // Equal keys keep their order.
+    let e = try t.sort([asc("x")]) catch _ { t };
+    assert(ints(e, 2) == [4, 0, 2, 3, 1]);
+}
+
+#[test]
+fn nulls_first_and_last() {
+    let t = pkg::table!{ "x": [2, none, 1, none, 3] };
+    assert(ints(try t.sort([asc("x")]) catch _ { t }, 0) == [1, 2, 3, none, none]);
+    assert(ints(try t.sort([asc("x").nulls_first()]) catch _ { t }, 0) == [none, none, 1, 2, 3]);
+    assert(ints(try t.sort([desc("x")]) catch _ { t }, 0) == [3, 2, 1, none, none]);
+    assert(ints(try t.sort([desc("x").nulls_first()]) catch _ { t }, 0) == [none, none, 3, 2, 1]);
+    let s = pkg::table!{ "s": ["b", none, "a"] };
+    assert((try s.sort([asc("s")]) catch _ { s }).column_at(0).to_options_str() == ["a", "b", none]);
+}
+
+#[test]
+fn other_types() {
+    let t = pkg::table!{ "d": [date"2024-01-02", date"1999-05-05", date"2024-01-01"], "b": [true, false, true] };
+    let s = try t.sort([asc("d")]) catch _ { t };
+    assert(s.row(0).get("d") == Value::Date(date"1999-05-05"));
+    let b = try t.sort([asc("b"), desc("d")]) catch _ { t };
+    assert(b.row(1).get("d") == Value::Date(date"2024-01-02"));
+    let c = try Table::from_columns([("c", Column::cat(["zeta", "alpha", "mid", "alpha"]))]) catch _ { t };
+    assert((try c.sort([asc("c")]) catch _ { c }).column_at(0).to_options_str() == ["alpha", "alpha", "mid", "zeta"]);
+    let big = pkg::table!{ "x": [9223372036854775807, -9223372036854775807, 0] };
+    assert(ints(try big.sort([asc("x")]) catch _ { big }, 0) == [-9223372036854775807, 0, 9223372036854775807]);
+}
+
+#[test]
+fn empty_and_errors() {
+    let t = pkg::table!{ "x": [1] };
+    let e = t.head(0);
+    assert((try e.sort([asc("x")]) catch _ { t }).nrows() == 0);
+    assert((try t.sort([asc("y")]) catch _ { e }).nrows() == 0);
+    assert((try t.argsort([]) catch _ { [9] }) == [0]);
+}
+
+#[test]
+fn random_against_comparison_sort() {
+    let rng = Xoshiro256PlusPlus::seed(2024u64);
+    for round in 0..5 {
+        let n = 2000 + round * 997;
+        let a: List<i64 | none> = List::from_fn(n, [ref rng] |_| if rng.below(10u64) == 0u64 { none } else { rng.below(50u64) as i64 - 25 });
+        let b: List<f64> = List::from_fn(n, [ref rng] |_| (rng.below(1000u64) as f64) / 7.0 - 50.0);
+        let s: List<str> = List::from_fn(n, [ref rng] |_| f"k{rng.below(30u64)}");
+        let t = try Table::from_columns([("a", Column::from(a)), ("b", Column::from(b)), ("s", Column::from(s))]) catch e { panic(f"{e}"); };
+        let got = try t.argsort([desc("a"), asc("s"), desc("b")]) catch e { panic(f"{e}"); };
+        let want: List<usize> = List::from_fn(n, |i| i);
+        want.sort_by(|x, y| {
+            let ax = a[x];
+            let ay = a[y];
+            // desc, nulls last
+            let c1 = match (ax, ay) {
+                (none, none) => Ordering::Equal,
+                (none, _) => Ordering::Greater,
+                (_, none) => Ordering::Less,
+                (p: i64, q: i64) => q.cmp(p),
+            };
+            if !c1.is_eq() { return c1; }
+            let c2 = s[x].cmp(s[y]);
+            if !c2.is_eq() { return c2; }
+            b[y].total_cmp(b[x])
+        });
+        assert(got == want, f"round {round}");
+    }
+}
+
+#[test]
+fn large_parallel_key_path() {
+    // Above the parallel threshold with two keys.
+    let n = 1100000;
+    let rng = Xoshiro256PlusPlus::seed(5u64);
+    let a: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(1000u64) as i64);
+    let b: List<i64> = List::from_fn(n, |i| (n - i) as i64);
+    let t = try Table::from_columns([("a", Column::from(a)), ("b", Column::from(b))]) catch e { panic(f"{e}"); };
+    let s = try t.sort([asc("a"), asc("b")]) catch e { panic(f"{e}"); };
+    let sa = try s.i64("a") catch _ { [0] };
+    let sb = try s.i64("b") catch _ { [0] };
+    let xa = sa.to_list();
+    let xb = sb.to_list();
+    for i in 1..n {
+        assert(xa[i - 1] < xa[i] || (xa[i - 1] == xa[i] && xb[i - 1] < xb[i]));
+    }
+}

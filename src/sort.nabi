@@ -1,0 +1,320 @@
+//! Sorting: every key becomes an order-preserving u64 per row (numbers by
+//! their bits, strings by rank among the distinct values), then a stable
+//! LSD radix sort of (key, row) pairs, last key first. O(n) per key; 11-bit
+//! digits, constant digits skipped. Above `PAR_ROWS` rows the keys are
+//! encoded and the radix passes run on several workers.
+
+use pkg::column::Data;
+use pkg::{Column, Table, TableError};
+use core::par;
+
+/// One sort key: a column, its direction and where nulls go.
+///
+/// ```nabi
+/// use table::{asc, desc};
+/// let t = table::table!{ "g": ["b", "a", "b"], "x": [1, 2, 3] };
+/// let s = try t.sort([asc("g"), desc("x")]) catch _ { t };
+/// assert(s.column_at(1).to_options_i64() == [2, 3, 1]);
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct SortKey {
+    pub name: str;
+    pub descending: bool;
+    pub nulls_last: bool;
+}
+
+/// Ascending by `name`, nulls last.
+pub fn asc(name: str) -> SortKey { SortKey { name, descending: false, nulls_last: true } }
+
+/// Descending by `name`, nulls last.
+pub fn desc(name: str) -> SortKey { SortKey { name, descending: true, nulls_last: true } }
+
+impl SortKey {
+    /// Nulls before every value.
+    pub fn nulls_first(self) -> SortKey { SortKey { name: self.name, descending: self.descending, nulls_last: false } }
+
+    /// Nulls after every value.
+    pub fn nulls_last(self) -> SortKey { SortKey { name: self.name, descending: self.descending, nulls_last: true } }
+}
+
+/// Rows above which key encoding runs on several workers.
+pub(pkg) const PAR_ROWS: usize = 1000000;
+
+const SIGN: u64 = 0x8000000000000000u64;
+
+/// The order of `f64` bits: negatives reversed, one NaN after +inf,
+/// -0.0 equal to 0.0.
+pub(pkg) fn fkey(x: f64) -> u64 {
+    if x.is_nan() { return 0xFFF8000000000000u64; }
+    if x == 0.0 { return SIGN; }
+    let b = x.to_bits();
+    if b & SIGN != 0u64 { !b } else { b | SIGN }
+}
+
+/// The rank of each string among the distinct `xs` (ascending), per row.
+fn str_ranks(xs: List<str>, c: Column) -> List<u64> {
+    let ids: Dict<str, u32> = Dict::new();
+    let distinct: List<str> = List::new();
+    let code: List<u32> = List::with_capacity(xs.len());
+    for i in 0..xs.len() {
+        if c.is_null(i) {
+            code.push(0u32);
+            continue;
+        }
+        let s = xs[i];
+        code.push(match ids.get(s) {
+            k: u32 => k,
+            none => {
+                let k = distinct.len() as u32;
+                distinct.push(s);
+                _ = ids.insert(s, k);
+                k
+            },
+        });
+    }
+    let rank = level_ranks(distinct);
+    let out: List<u64> = List::with_capacity(xs.len());
+    for k in code { out.push(rank[k as usize]); }
+    out
+}
+
+/// `rank[k]` is the position of `levels[k]` in ascending order.
+fn level_ranks(levels: List<str>) -> List<u64> {
+    let order: List<usize> = List::from_fn(levels.len(), |k| k);
+    order.sort_by(|a, b| levels[a].cmp(levels[b]));
+    let rank: List<u64> = List::filled(levels.len(), 0u64);
+    for r in 0..order.len() { rank[order[r]] = r as u64; }
+    rank
+}
+
+/// Order-preserving keys of `c` (nulls get 0; their flag sorts them).
+pub(pkg) fn key_bits(c: Column) -> List<u64> {
+    let n = c.len();
+    let out: List<u64> = List::with_capacity(n);
+    match c.data {
+        Data::I64(a) => for x in a { out.push((x as u64) ^ SIGN); },
+        Data::F64(a) => for x in a { out.push(fkey(x)); },
+        Data::Bool(a) => for x in a { out.push(if x { 1u64 } else { 0u64 }); },
+        Data::Str(a) => return str_ranks(a, c),
+        Data::Cat(a, lv) => {
+            let rank = level_ranks(lv);
+            for x in a { out.push(rank[x as usize]); }
+        },
+        Data::Date(a) => for x in a { out.push((x as i64 as u64) ^ SIGN); },
+        Data::DateTime(a) => for x in a { out.push((x as u64) ^ SIGN); },
+    }
+    if c.null_count() > 0 {
+        for i in 0..n {
+            if c.is_null(i) { out[i] = 0u64; }
+        }
+    }
+    out
+}
+
+/// A key's bits in final form: direction applied.
+struct Prepared {
+    bits: List<u64>;
+    nulls: List<bool> | none;
+    nulls_last: bool;
+}
+
+fn prepare(c: Column, k: SortKey) -> Prepared {
+    let bits = key_bits(c);
+    if k.descending {
+        for i in 0..bits.len() { bits[i] = !bits[i]; }
+    }
+    let nulls: List<bool> | none = if c.null_count() > 0 { List::from_fn(c.len(), |i| c.is_null(i)) } else { none };
+    Prepared { bits, nulls, nulls_last: k.nulls_last }
+}
+
+/// Stable LSD radix sort of `perm` by `key[perm[i]]`, 11 bits a pass.
+/// Above `PAR_ROWS` rows: chunks sort on several workers, sampled
+/// splitters cut the key range into one part per worker, and each part
+/// (its pieces from every chunk, in chunk order) sorts again on its own
+/// worker. Equal keys share a part and keep chunk order: stable.
+pub(pkg) fn radix_by(key: List<u64>, perm: List<u32>) -> List<u32> {
+    let n = perm.len();
+    // Keys in current order, carried with the rows.
+    let ka: List<u64> = List::filled(n, 0u64);
+    for i in 0..n { ka[i] = key[perm[i] as usize]; }
+    if n < PAR_ROWS {
+        return radix_pairs(ka, perm.clone()).1;
+    }
+    let chunks = task::cpu_count().max(2).min(n);
+    let size = (n + chunks - 1) / chunks;
+    let items: List<(Slice<u64>, Slice<u32>)> = List::new();
+    let start: usize = 0;
+    while start < n {
+        let end = (start + size).min(n);
+        items.push((ka[start:end], perm[start:end]));
+        start = end;
+    }
+    let runs: List<(List<u64>, List<u32>)> = par::map(items, |it| radix_pairs(it.0.to_list(), it.1.to_list()));
+    let sample: List<u64> = List::new();
+    for r in runs {
+        let step = (r.0.len() / 64).max(1);
+        let i: usize = 0;
+        while i < r.0.len() {
+            sample.push(r.0[i]);
+            i += step;
+        }
+    }
+    sample.sort();
+    let parts = chunks;
+    let split: List<u64> = List::from_fn(parts - 1, |p| sample[(p + 1) * sample.len() / parts]);
+    let jobs: List<List<(Slice<u64>, Slice<u32>)>> = List::new();
+    for p in 0..parts {
+        let job: List<(Slice<u64>, Slice<u32>)> = List::new();
+        for r in runs {
+            let lo = if p == 0 { 0 } else { lower_bound(r.0, split[p - 1]) };
+            let hi = if p == parts - 1 { r.0.len() } else { lower_bound(r.0, split[p]) };
+            if hi > lo { job.push((r.0[lo:hi], r.1[lo:hi])); }
+        }
+        jobs.push(job);
+    }
+    let sorted: List<List<u32>> = par::map(jobs, |job| {
+        let m: usize = 0;
+        for x in job { m += x.0.len(); }
+        let ks: List<u64> = List::filled(m, 0u64);
+        let rows: List<u32> = List::filled(m, 0u32);
+        let o: usize = 0;
+        for x in job {
+            let pk = x.0;
+            let pi = x.1;
+            for j in 0..pk.len() {
+                ks[o] = pk[j];
+                rows[o] = pi[j];
+                o += 1;
+            }
+        }
+        radix_pairs(ks, rows).1
+    });
+    let out: List<u32> = List::filled(n, 0u32);
+    let o: usize = 0;
+    for part in sorted {
+        for x in part {
+            out[o] = x;
+            o += 1;
+        }
+    }
+    out
+}
+
+/// The first position of `xs` (ascending) holding a value `>= x`.
+fn lower_bound(xs: List<u64>, x: u64) -> usize {
+    let lo: usize = 0;
+    let hi = xs.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if xs[mid] < x { lo = mid + 1; } else { hi = mid; }
+    }
+    lo
+}
+
+/// LSD radix sort of the pairs `(ka[i], ia[i])` by key, stable; both
+/// lists are reused as buffers.
+fn radix_pairs(ka: List<u64>, ia: List<u32>) -> (List<u64>, List<u32>) {
+    let n = ka.len();
+    let hist: List<usize> = List::filled(6 * 2048, 0);
+    for x in ka {
+        for d in 0..6 {
+            let b = ((x >> (d * 11) as u64) & 2047u64) as usize;
+            hist[d * 2048 + b] += 1;
+        }
+    }
+    let kb: List<u64> = List::filled(n, 0u64);
+    let ib: List<u32> = List::filled(n, 0u32);
+    for d in 0..6 {
+        let base = d * 2048;
+        // A digit every key shares moves nothing.
+        let skip = false;
+        for b in 0..2048 {
+            if hist[base + b] == n {
+                skip = true;
+                break;
+            }
+            if hist[base + b] != 0 { break; }
+        }
+        if skip || n == 0 { continue; }
+        let off: List<usize> = List::filled(2048, 0);
+        let s: usize = 0;
+        for b in 0..2048 {
+            off[b] = s;
+            s += hist[base + b];
+        }
+        let sh = (d * 11) as u64;
+        for i in 0..n {
+            let x = ka[i];
+            let b = ((x >> sh) & 2047u64) as usize;
+            let o = off[b];
+            kb[o] = x;
+            ib[o] = ia[i];
+            off[b] = o + 1;
+        }
+        let tk = ka;
+        ka = kb;
+        kb = tk;
+        let ti = ia;
+        ia = ib;
+        ib = ti;
+    }
+    (ka, ia)
+}
+
+/// Stable partition of `perm` by the null flag: nulls to the end
+/// (`last`) or the front.
+fn null_pass(nulls: List<bool>, perm: List<u32>, last: bool) -> List<u32> {
+    let out: List<u32> = List::with_capacity(perm.len());
+    for p in perm {
+        if nulls[p as usize] != last { out.push(p); }
+    }
+    for p in perm {
+        if nulls[p as usize] == last { out.push(p); }
+    }
+    out
+}
+
+impl Table {
+    /// The row order that sorts by `keys` (stable: ties keep their
+    /// order), without moving any data.
+    pub fn argsort(self, keys: List<SortKey>) throws (TableError) -> List<usize> {
+        let cols: List<Column> = List::new();
+        for k in keys { cols.push(try self.column(k.name)); }
+        let ps: List<Prepared> = if self.rows >= PAR_ROWS && keys.len() > 1 {
+            // Each item carries its own column, so the workers share nothing.
+            par::map(List::from_fn(keys.len(), |j| (cols[j], keys[j])), |p| prepare(p.0, p.1))
+        } else {
+            List::from_fn(keys.len(), |j| prepare(cols[j], keys[j]))
+        };
+        let perm: List<u32> = List::from_fn(self.rows, |i| i as u32);
+        let j = keys.len();
+        while j > 0 {
+            j -= 1;
+            let p = ps[j];
+            perm = radix_by(p.bits, perm);
+            if let nl: List<bool> = p.nulls {
+                perm = null_pass(nl, perm, p.nulls_last);
+            }
+        }
+        List::from_fn(perm.len(), |i| perm[i] as usize)
+    }
+
+    /// The rows ordered by `keys` (stable, multi-key; each key
+    /// ascending or descending with nulls first or last). Strings sort
+    /// by code point, floats with NaN after every number.
+    ///
+    /// ```nabi
+    /// use table::desc;
+    /// let t = table::table!{ "x": [2.0, none, 3.0, 1.0] };
+    /// let s = try t.sort([desc("x").nulls_first()]) catch _ { t };
+    /// assert(s.column_at(0).to_options_f64() == [none, 3.0, 2.0, 1.0]);
+    /// ```
+    pub fn sort(self, keys: List<SortKey>) throws (TableError) -> Table {
+        self.take_unchecked(try self.argsort(keys))
+    }
+
+    /// Ascending by the columns `names`.
+    pub fn sort_by(self, names: List<str>) throws (TableError) -> Table {
+        try self.sort(names.iter().map(|n| asc(n)).collect())
+    }
+}

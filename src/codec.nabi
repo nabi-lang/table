@@ -1,0 +1,6 @@
+//! Compression codecs of the binary formats, in pure Nabi: Snappy both
+//! ways, Zstandard and LZ4 frames for reading.
+
+pub(pkg) mod lz4;
+pub(pkg) mod snappy;
+pub(pkg) mod zstd;

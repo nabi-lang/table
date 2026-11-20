@@ -1,0 +1,230 @@
+// CSV and JSON lines: RFC 4180 edge cases, inference, overrides,
+// streaming, round trips, files.
+
+use pkg::{Csv, DType, Table, Value};
+use core::collections::SliceMut;
+use core::io::IoError;
+use std::{env, fs};
+
+fn read(s: str) -> Table { try pkg::read_csv_str(s) catch e { panic(f"{e}"); } }
+
+fn read_error(s: str) -> str {
+    try pkg::read_csv_str(s) catch e { return e.message(); };
+    ""
+}
+
+#[test]
+fn quoting_and_line_ends() {
+    let t = read("a,b\r\n\"x,1\",\"he said \"\"hi\"\"\"\r\n\"multi\nline\",\"\"\r\n");
+    assert(t.shape() == (2, 2));
+    assert(t.row(0).str("a") == "x,1");
+    assert(t.row(0).str("b") == "he said \"hi\"");
+    assert(t.row(1).str("a") == "multi\nline");
+    // A quoted field is a value even when its text is a null token.
+    assert(t.row(1).get("b") == Value::Str(""));
+    let q = read("a,b\n\"NA\",NA\n");
+    assert(q.row(0).get("a") == Value::Str("NA") && q.row(0).get("b") == Value::Null);
+    let cr = read("a,b\r1,2\r3,4\r");
+    assert(cr.shape() == (2, 2) && cr.row(1).i64("b") == 4);
+    let crlf_in_quotes = read("a\n\"x\r\ny\"\n");
+    assert(crlf_in_quotes.row(0).str("a") == "x\r\ny");
+    let no_final_newline = read("a,b\n1,2");
+    assert(no_final_newline.nrows() == 1);
+    let trailing_empty = read("a,b\n1,\n");
+    assert(trailing_empty.row(0).get("b") == Value::Null);
+}
+
+#[test]
+fn bom_and_blank_lines() {
+    let t = read("\u{FEFF}id,name\n1,ann\n\n2,bob\n");
+    assert(t.names() == ["id", "name"]);
+    assert(t.nrows() == 2);
+}
+
+#[test]
+fn inference_and_nulls() {
+    let t = read("i,f,b,d,ts,s,n\n1,1.5,true,2024-01-02,2024-01-02T03:04:05,x,\n-2,NA,FALSE,2024-12-31,2024-01-02 00:00:00.5,1,\n,1e3,,,,,\n");
+    assert(t.dtypes() == [DType::I64, DType::F64, DType::Bool, DType::Date, DType::DateTime, DType::Str, DType::Str]);
+    assert(t.column_at(0).null_count() == 1 && t.column_at(1).null_count() == 1);
+    assert(t.row(2).f64("f") == 1000.0);
+    assert(t.column_at(6).null_count() == 3);
+    let big = read("x\n9223372036854775807\n9223372036854775808\n");
+    assert(big.column_at(0).dtype() == DType::F64);
+    let mixed = read("x\n1\n2.5\nnan\n");
+    assert(mixed.column_at(0).dtype() == DType::F64);
+}
+
+#[test]
+fn overrides_and_options() {
+    let o = Csv::new().delimiter('\t').types([("zip", DType::Str), ("n", DType::F64)]).null("-");
+    let t = try o.read_str("zip\tn\tc\n02134\t3\t-\n10001\t-\tz\n") catch e { panic(f"{e}"); };
+    assert(t.row(0).str("zip") == "02134");
+    assert(t.column_at(1).dtype() == DType::F64 && t.column_at(1).null_count() == 1);
+    assert(t.column_at(2).null_count() == 1);
+    let nh = try Csv::new().has_header(false).read_str("1,a\n2,b\n") catch e { panic(f"{e}"); };
+    assert(nh.names() == ["column_1", "column_2"] && nh.nrows() == 2);
+    let tr = try Csv::new().trimmed(true).read_str("a , b\n 1 , x \n") catch e { panic(f"{e}"); };
+    assert(tr.names() == ["a", "b"] && tr.row(0).i64("a") == 1 && tr.row(0).str("b") == "x");
+    let exact = try Csv::new().null_tokens(["?"]).read_str("a\nNA\n?\n") catch e { panic(f"{e}"); };
+    assert(exact.row(0).str("a") == "NA" && exact.column_at(0).null_count() == 1);
+    let bad = try Csv::new().types([("a", DType::I64)]).read_str("a\n1\nx\n").nrows() as i64 catch e {
+        assert(e.message().contains("column `a`, row 2") && e.message().contains("`str`"), e.message());
+        -1
+    };
+    assert(bad == -1);
+    let cat = try Csv::new().types([("c", DType::Cat)]).read_str("c\nu\nv\nu\n") catch e { panic(f"{e}"); };
+    assert(cat.column_at(0).dtype() == DType::Cat && cat.column_at(0).levels() == ["u", "v"]);
+}
+
+#[test]
+fn malformed_input() {
+    let r = read_error("a,b\n1,2,3\n");
+    assert(r.contains("row 1 has 3 fields but the header has 2"), r);
+    let q = read_error("a\n\"open\n");
+    assert(q.contains("never closed"), q);
+    let after = read_error("a,b\n\"x\"y,1\n");
+    assert(after.contains("after a closing quote"), after);
+    let dup = read_error("a,a\n1,2\n");
+    assert(dup.contains("names `a` twice"), dup);
+    let empty = read("");
+    assert(empty.shape() == (0, 0));
+    let header_only = read("a,b\n");
+    assert(header_only.shape() == (0, 2));
+}
+
+#[test]
+fn write_and_round_trip() {
+    let t = pkg::table!{
+        "s": ["plain", "comma,here", "quote\"d", "line\nbreak", "", none],
+        "f": [0.1, -2.5, 1e300, f64::NAN, 3.0, none],
+        "d": [date"2024-01-01", none, date"1970-01-01", date"2000-02-29", none, date"1969-12-31"],
+    };
+    let text = Csv::new().write_str(t);
+    let back = try Csv::new().read_str(text) catch e { panic(f"{e}"); };
+    assert(back.dtypes() == t.dtypes());
+    for k in 0..3 {
+        for i in 0..6 {
+            let a = t.column_at(k).get(i);
+            let b = back.column_at(k).get(i);
+            let both_nan = match (a, b) {
+                (Value::Float(x), Value::Float(y)) => x.is_nan() && y.is_nan(),
+                _ => false,
+            };
+            assert(a == b || both_nan, f"cell {i},{k}: {a} vs {b}");
+        }
+    }
+    let crlf = Csv::new().crlf_lines(true).write_str(pkg::table!{ "a": [1] });
+    assert(crlf == "a\r\n1\r\n");
+    let semi = Csv::new().delimiter(';').write_str(pkg::table!{ "a": ["x;y"], "b": [1] });
+    assert(semi == "a;b\n\"x;y\";1\n");
+}
+
+#[test]
+fn files() {
+    let dir = f"{env::temp_dir()}/table-test-io";
+    _ = try? fs::create_dir_all(dir);
+    let t = pkg::table!{ "a": [1, 2], "b": ["x", none] };
+    let p = f"{dir}/t.csv";
+    try t |> pkg::write_csv(p) catch e { panic(f"{e}"); };
+    let back = try p |> pkg::read_csv catch e { panic(f"{e}"); };
+    assert(back.shape() == (2, 2) && back.row(1).get("b") == Value::Null);
+    let j = f"{dir}/t.jsonl";
+    try t |> pkg::write_jsonl(j) catch e { panic(f"{e}"); };
+    let jb = try j |> pkg::read_jsonl catch e { panic(f"{e}"); };
+    assert(jb.shape() == (2, 2));
+    let missing = try pkg::read_csv(f"{dir}/nope.csv").nrows() as i64 catch e {
+        assert(e.message().contains("cannot read"), e.message());
+        -1
+    };
+    assert(missing == -1);
+}
+
+/// A reader handing out `step` bytes at a time.
+struct Chunks {
+    data: List<u8>;
+    at: usize;
+    step: usize;
+}
+
+impl Read for Chunks {
+    fn read(ref self, buf: SliceMut<u8>) throws (IoError) -> usize {
+        let n = 0usize;
+        while n < self.step && n < buf.len() && self.at < self.data.len() {
+            buf[n] = self.data[self.at];
+            n += 1;
+            self.at += 1;
+        }
+        n
+    }
+}
+
+#[test]
+fn streaming_reader() {
+    let lines = StrBuf::new();
+    lines.push_str("\u{FEFF}id,text,x\r\n");
+    for i in 0..1000 {
+        lines.push_str(f"{i},\"row {i}, with \"\"quotes\"\"\nand a break\",{i}.5\r\n");
+    }
+    let src = lines.to_str();
+    let whole = read(src);
+    for step in [1usize, 7, 4096, 1000000] {
+        let r = Csv::new().batch_rows(64).reader(Chunks { data: src.as_bytes().to_list(), at: 0, step });
+        let parts = 0;
+        let all = Table::new();
+        loop {
+            let b = try r.next() catch e { panic(f"step {step}: {e}"); };
+            match b {
+                b: Table => {
+                    assert(b.nrows() <= 64);
+                    parts += 1;
+                    all = try all.vstack(b) catch e { panic(f"{e}"); };
+                },
+                none => break,
+            }
+        }
+        assert(parts == 16, f"step {step}: {parts} batches");
+        assert(all.nrows() == 1000);
+        assert(all.names() == ["id", "text", "x"]);
+        for i in [0usize, 1, 517, 999] {
+            assert(all.row(i).values() == whole.row(i).values(), f"step {step} row {i}");
+        }
+    }
+    // A later cell that does not fit the inferred type names the column.
+    let bad = StrBuf::new();
+    bad.push_str("n\n");
+    for i in 0..20 { bad.push_str(f"{i}\n"); }
+    bad.push_str("oops\n");
+    let r = Csv::new().batch_rows(5).reader(Chunks { data: bad.to_str().as_bytes().to_list(), at: 0, step: 3 });
+    let m = try r.read_all().nrows() as i64 catch e {
+        assert(e.message().contains("column `n`") && e.message().contains("Csv::types"), e.message());
+        -1
+    };
+    assert(m == -1);
+}
+
+#[test]
+fn json_lines() {
+    let t = try pkg::read_jsonl_str("{\"a\": 1, \"b\": \"x\", \"c\": [1, 2]}\n\n{\"b\": null, \"a\": 2, \"d\": true}\n{\"a\": 3.5}\n") catch e { panic(f"{e}"); };
+    assert(t.names() == ["a", "b", "c", "d"]);
+    assert(t.dtypes() == [DType::F64, DType::Str, DType::Str, DType::Bool]);
+    assert(t.row(0).str("c") == "[1,2]");
+    assert(t.column_at(1).null_count() == 2 && t.column_at(3).null_count() == 2);
+    let ints = try pkg::read_jsonl_str("{\"n\": 1}\n{\"n\": 99999999999999999999}\n") catch e { panic(f"{e}"); };
+    assert(ints.column_at(0).dtype() == DType::F64);
+    let bad = try pkg::read_jsonl_str("{\"a\": 1}\n[1]\n").nrows() as i64 catch e {
+        assert(e.message().starts_with("2:") && e.message().contains("JSON object"), e.message());
+        -1
+    };
+    assert(bad == -1);
+    let syntax = try pkg::read_jsonl_str("{\"a\": }\n").nrows() as i64 catch e {
+        assert(e.message().starts_with("1:"), e.message());
+        -1
+    };
+    assert(syntax == -1);
+    let w = pkg::table!{ "x": [1.5, f64::NAN], "d": [date"2024-05-06", none], "s": ["q\"", "\n"] };
+    let text = pkg::write_jsonl_str(w);
+    assert(text == "{\"x\":1.5,\"d\":\"2024-05-06\",\"s\":\"q\\\"\"}\n{\"x\":null,\"d\":null,\"s\":\"\\n\"}\n", text);
+    let back = try pkg::read_jsonl_str(text) catch e { panic(f"{e}"); };
+    assert(back.row(0).str("s") == "q\"" && back.row(1).f64("x") is none);
+    assert((try pkg::read_jsonl_str("") catch _ { w }).shape() == (0, 0));
+}

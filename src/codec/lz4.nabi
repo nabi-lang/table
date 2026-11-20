@@ -1,0 +1,86 @@
+// LZ4 frames, which Arrow uses for LZ4_FRAME bodies: the frame header,
+// compressed and stored blocks, linked or not. Checksums are skipped,
+// not checked; dictionaries are not supported.
+
+use pkg::TableError;
+use pkg::bytes::{bad, u32_at};
+
+const FMT: str = "lz4";
+
+fn fail(msg: str) -> TableError { bad(FMT, msg) }
+
+fn block(b: List<u8>, s: usize, e: usize, out: List<u8>) throws (TableError) {
+    let p = s;
+    while p < e {
+        let token = b[p] as usize;
+        p += 1;
+        let n = token >> 4;
+        if n == 15 {
+            loop {
+                if p >= e { throw fail("a literal length is cut short"); }
+                let x = b[p] as usize;
+                p += 1;
+                n += x;
+                if x != 255 { break; }
+            }
+        }
+        if p + n > e { throw fail("literals run past the block"); }
+        for i in p..p + n {
+            out.push(b[i]);
+        }
+        p += n;
+        if p == e { break; }
+        if p + 2 > e { throw fail("a match offset is cut short"); }
+        let off = (b[p] as usize) | ((b[p + 1] as usize) << 8);
+        p += 2;
+        let m = (token & 15) + 4;
+        if token & 15 == 15 {
+            loop {
+                if p >= e { throw fail("a match length is cut short"); }
+                let x = b[p] as usize;
+                p += 1;
+                m += x;
+                if x != 255 { break; }
+            }
+        }
+        if off == 0 || off > out.len() { throw fail("a match reaches before the start of the data"); }
+        let from = out.len() - off;
+        for k in 0..m {
+            out.push(out[from + k]);
+        }
+    }
+}
+
+/// The LZ4 frames in `b[s..e]`, decompressed.
+pub(pkg) fn frame(b: List<u8>, s: usize, e: usize) throws (TableError) -> List<u8> {
+    let out: List<u8> = List::new();
+    let p = s;
+    while p < e {
+        if p + 7 > e { throw fail("a frame header is cut short"); }
+        if u32_at(b, p) != 0x184D2204u64 { throw fail("not an LZ4 frame (bad magic number)"); }
+        let flg = b[p + 4] as usize;
+        if flg >> 6 != 1 { throw fail("an LZ4 frame version other than 1"); }
+        if flg & 1 == 1 { throw fail("the frame needs a dictionary; compress it without one"); }
+        let block_sum = (flg >> 4) & 1 == 1;
+        let content_sum = (flg >> 2) & 1 == 1;
+        p += 6 + if (flg >> 3) & 1 == 1 { 8 } else { 0 } + 1;
+        loop {
+            if p + 4 > e { throw fail("a block size is cut short"); }
+            let h = u32_at(b, p) as usize;
+            p += 4;
+            if h == 0 { break; }
+            let n = h & 0x7FFFFFFF;
+            if p + n > e { throw fail("a block is cut short"); }
+            if h & 0x80000000 != 0 {
+                for i in p..p + n {
+                    out.push(b[i]);
+                }
+            } else {
+                try block(b, p, p + n, out);
+            }
+            p += n + if block_sum { 4 } else { 0 };
+        }
+        if content_sum { p += 4; }
+    }
+    out
+}

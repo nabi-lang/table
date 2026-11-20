@@ -1,0 +1,323 @@
+//! Calendar dates and timestamps in the proleptic Gregorian calendar,
+//! UTC, with no leap seconds. Day arithmetic follows Howard Hinnant's
+//! `days_from_civil` / `civil_from_days`, exact over the whole range.
+
+use std::time::SystemTime;
+
+/// A calendar date: days since 1970-01-01 (negative before it).
+///
+/// ```nabi
+/// let d = table::Date::ymd(2024, 2, 29) ?? table::Date::from_days(0);
+/// assert(f"{d}" == "2024-02-29");
+/// assert(d.weekday() == 3); // Thursday, Monday is 0
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Date {
+    pub(pkg) days: i32;
+}
+
+/// An instant: nanoseconds since 1970-01-01T00:00:00Z, which covers
+/// the years 1677 to 2262.
+///
+/// ```nabi
+/// let t = table::DateTime::parse("2024-01-15T10:30:00Z") ?? table::DateTime::from_ns(0);
+/// assert(t.date() == (table::Date::ymd(2024, 1, 15) ?? table::Date::from_days(0)));
+/// assert(f"{t}" == "2024-01-15T10:30:00");
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DateTime {
+    pub(pkg) ns: i64;
+}
+
+const NS_PER_SEC: i64 = 1000000000;
+const NS_PER_DAY: i64 = 86400000000000;
+
+/// Days from 1970-01-01 to `y-m-d`.
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = (if yy >= 0 { yy } else { yy - 399 }) / 400;
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// `(year, month, day)` of day `z` since 1970-01-01.
+const fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let zz = z + 719468;
+    let era = (if zz >= 0 { zz } else { zz - 146096 }) / 146097;
+    let doe = zz - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
+const fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+
+const fn month_len(y: i64, m: i64) -> i64 {
+    if m == 2 {
+        return if is_leap(y) { 29 } else { 28 };
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 { 30 } else { 31 }
+}
+
+/// `n` ASCII digits of `s` from `at`, or `none`.
+const fn digits(s: str, at: usize, n: usize) -> i64 | none {
+    if at + n > s.len() {
+        return none;
+    }
+    let v: i64 = 0;
+    for k in 0..n {
+        let b = s.byte(at + k);
+        if b < 0x30u8 || b > 0x39u8 {
+            return none;
+        }
+        v = v * 10 + (b - 0x30u8) as i64;
+    }
+    v
+}
+
+/// `YYYY-MM-DD` at the start of `s` as days, or `none`.
+const fn parse_ymd(s: str) -> i64 | none {
+    let y = digits(s, 0, 4)?;
+    if s.len() < 10 || s.byte(4) != 0x2Du8 || s.byte(7) != 0x2Du8 {
+        return none;
+    }
+    let m = digits(s, 5, 2)?;
+    let d = digits(s, 8, 2)?;
+    if m < 1 || m > 12 || d < 1 || d > month_len(y, m) {
+        return none;
+    }
+    days_from_civil(y, m, d)
+}
+
+const fn pad2(n: i64) -> str { if n < 10 { f"0{n}" } else { f"{n}" } }
+
+const fn pad4(n: i64) -> str {
+    if n < 0 {
+        return f"-{pad4(-n)}";
+    }
+    if n < 10 { f"000{n}" } else if n < 100 { f"00{n}" } else if n < 1000 { f"0{n}" } else { f"{n}" }
+}
+
+impl Date {
+    /// The date `days` after 1970-01-01.
+    ///
+    /// ```nabi
+    /// assert(f"{table::Date::from_days(19723)}" == "2024-01-01");
+    /// ```
+    pub const fn from_days(days: i32) -> Date { Date { days } }
+
+    /// `year-month-day`, or `none` when there is no such day.
+    ///
+    /// ```nabi
+    /// assert(table::Date::ymd(2023, 2, 29) is none);
+    /// ```
+    pub const fn ymd(year: i32, month: u32, day: u32) -> Date | none {
+        let y = year as i64;
+        let m = month as i64;
+        let d = day as i64;
+        if m < 1 || m > 12 || d < 1 || d > month_len(y, m) {
+            return none;
+        }
+        Date { days: days_from_civil(y, m, d) as i32 }
+    }
+
+    /// An ISO 8601 date, `YYYY-MM-DD`; `none` for anything else.
+    ///
+    /// ```nabi
+    /// assert(table::Date::parse("2024-13-01") is none);
+    /// ```
+    pub const fn parse(s: str) -> Date | none {
+        if s.len() != 10 {
+            return none;
+        }
+        Date { days: parse_ymd(s)? as i32 }
+    }
+
+    /// Days since 1970-01-01.
+    pub const fn days(self) -> i32 { self.days }
+
+    /// `(year, month, day)`.
+    ///
+    /// ```nabi
+    /// let d = table::Date::from_days(0);
+    /// assert(d.parts() == (1970, 1u32, 1u32));
+    /// ```
+    pub const fn parts(self) -> (i32, u32, u32) {
+        let (y, m, d) = civil_from_days(self.days as i64);
+        (y as i32, m as u32, d as u32)
+    }
+
+    /// The year (proleptic Gregorian, year 0 is 1 BC).
+    pub const fn year(self) -> i32 { self.parts().0 }
+    /// The month, 1 to 12.
+    pub const fn month(self) -> u32 { self.parts().1 }
+    /// The day of the month, 1 to 31.
+    pub const fn day(self) -> u32 { self.parts().2 }
+
+    /// Day of the week, Monday 0 to Sunday 6.
+    pub const fn weekday(self) -> u32 {
+        // 1970-01-01 was a Thursday (3).
+        (((self.days as i64 + 3) %% 7)) as u32
+    }
+
+    /// `n` days later (earlier for a negative `n`).
+    ///
+    /// ```nabi
+    /// assert(f"{table::Date::from_days(0).add_days(-1)}" == "1969-12-31");
+    /// ```
+    pub const fn add_days(self, n: i32) -> Date { Date { days: self.days + n } }
+
+    /// Midnight UTC of this day.
+    pub const fn at_midnight(self) -> DateTime { DateTime { ns: self.days as i64 * NS_PER_DAY } }
+}
+
+impl DateTime {
+    /// `ns` nanoseconds after 1970-01-01T00:00:00Z.
+    pub const fn from_ns(ns: i64) -> DateTime { DateTime { ns } }
+
+    /// Whole seconds after the epoch.
+    pub const fn from_secs(secs: i64) -> DateTime { DateTime { ns: secs * NS_PER_SEC } }
+
+    /// A `std::time::SystemTime`, to the nanosecond.
+    pub fn from_system(t: SystemTime) -> DateTime { DateTime { ns: t.unix_nanos() } }
+
+    /// ISO 8601 `YYYY-MM-DD`, then optionally `T` or a space and
+    /// `HH:MM`, `:SS`, a fraction of up to 9 digits and a final `Z`;
+    /// `none` for anything else. A bare date is midnight.
+    ///
+    /// ```nabi
+    /// let t = table::DateTime::parse("2024-01-15 10:30:00.25") ?? table::DateTime::from_ns(0);
+    /// assert(t.ns() % 1000000000 == 250000000);
+    /// ```
+    pub const fn parse(s: str) -> DateTime | none {
+        let days = parse_ymd(s)?;
+        let n = s.len();
+        let ns = days * NS_PER_DAY;
+        if n == 10 {
+            return DateTime { ns };
+        }
+        let sep = s.byte(10);
+        if sep != 0x54u8 && sep != 0x20u8 {
+            return none;
+        }
+        let h = digits(s, 11, 2)?;
+        if n < 16 || s.byte(13) != 0x3Au8 {
+            return none;
+        }
+        let mi = digits(s, 14, 2)?;
+        let sec: i64 = 0;
+        let frac: i64 = 0;
+        let i: usize = 16;
+        if i < n && s.byte(i) == 0x3Au8 {
+            sec = digits(s, 17, 2)?;
+            i = 19;
+            if i < n && s.byte(i) == 0x2Eu8 {
+                i += 1;
+                let k: usize = 0;
+                while i < n && k < 9 && s.byte(i) >= 0x30u8 && s.byte(i) <= 0x39u8 {
+                    frac = frac * 10 + (s.byte(i) - 0x30u8) as i64;
+                    i += 1;
+                    k += 1;
+                }
+                if k == 0 {
+                    return none;
+                }
+                while k < 9 {
+                    frac *= 10;
+                    k += 1;
+                }
+            }
+        }
+        if i < n && s.byte(i) == 0x5Au8 {
+            i += 1;
+        }
+        if i != n || h > 23 || mi > 59 || sec > 59 {
+            return none;
+        }
+        DateTime { ns: ns + ((h * 60 + mi) * 60 + sec) * NS_PER_SEC + frac }
+    }
+
+    /// Nanoseconds since the epoch.
+    pub const fn ns(self) -> i64 { self.ns }
+
+    /// The calendar day (UTC).
+    pub const fn date(self) -> Date { Date { days: (self.ns.div_euclid(NS_PER_DAY)) as i32 } }
+
+    /// `(hour, minute, second, nanosecond)` within the day.
+    pub const fn time(self) -> (u32, u32, u32, u32) {
+        let t = self.ns.rem_euclid(NS_PER_DAY);
+        let s = t / NS_PER_SEC;
+        ((s / 3600) as u32, (s / 60 % 60) as u32, (s % 60) as u32, (t % NS_PER_SEC) as u32)
+    }
+
+    /// `d` later.
+    pub const fn add(self, d: Duration) -> DateTime { DateTime { ns: self.ns + d.as_ns() } }
+
+    /// The time from `earlier` to this one.
+    pub const fn since(self, earlier: DateTime) -> Duration { Duration::ns(self.ns - earlier.ns) }
+}
+
+impl Display for Date {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let (y, m, d) = civil_from_days(self.days as i64);
+        try f.write_str(f"{pad4(y)}-{pad2(m)}-{pad2(d)}")
+    }
+}
+
+impl Debug for Date {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"date\"{self}\"") }
+}
+
+/// ISO 8601 without a zone: `2024-01-15T10:30:00`, with a fraction
+/// only when there is one (`.25`, trailing zeros dropped).
+impl Display for DateTime {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let (h, mi, s, frac) = self.time();
+        let out = f"{self.date()}T{pad2(h as i64)}:{pad2(mi as i64)}:{pad2(s as i64)}";
+        if frac != 0u32 {
+            let digits = f"{frac as i64 + NS_PER_SEC}";
+            let tail = digits[1:].trim_end_matches("0");
+            out = out + "." + tail;
+        }
+        try f.write_str(out)
+    }
+}
+
+impl Debug for DateTime {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"datetime\"{self}\"") }
+}
+
+/// `date"2024-01-15"`: a `Date`, checked when the program compiles.
+///
+/// ```nabi
+/// let d = date"2024-01-15";
+/// assert(d.month() == 1u32);
+/// ```
+#[literal("date" string)]
+pub const fn date_literal(s: str) -> Date {
+    match Date::parse(s) {
+        d: Date => d,
+        none => panic(f"`{s}` is not a date: write `YYYY-MM-DD`, as in date\"2024-01-15\""),
+    }
+}
+
+/// `datetime"2024-01-15T10:30:00"`: a `DateTime`, checked when the
+/// program compiles.
+///
+/// ```nabi
+/// let t = datetime"2024-01-15T10:30:00";
+/// assert(t.time().0 == 10u32);
+/// ```
+#[literal("datetime" string)]
+pub const fn datetime_literal(s: str) -> DateTime {
+    match DateTime::parse(s) {
+        t: DateTime => t,
+        none => panic(f"`{s}` is not a timestamp: write `YYYY-MM-DDTHH:MM:SS`, as in datetime\"2024-01-15T10:30:00\""),
+    }
+}

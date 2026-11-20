@@ -1,0 +1,106 @@
+// Validity bitmap: bit i set when row i holds a value.
+
+/// One bit per row, 1 for a value, 0 for null.
+#[derive(Clone, PartialEq)]
+pub(pkg) struct Bitmap {
+    pub(pkg) words: List<u64>;
+    pub(pkg) len: usize;
+}
+
+impl Bitmap {
+    /// `n` rows, all valid.
+    pub(pkg) fn all(n: usize) -> Bitmap {
+        let w: List<u64> = List::filled((n + 63) / 64, 0xFFFFFFFFFFFFFFFFu64);
+        Bitmap { words: w, len: n }
+    }
+
+    /// From one flag per row.
+    pub(pkg) fn from_flags(flags: List<bool>) -> Bitmap {
+        let n = flags.len();
+        let w: List<u64> = List::filled((n + 63) / 64, 0u64);
+        for i in 0..n {
+            if flags[i] {
+                w[i >> 6] = w[i >> 6] | (1u64 << (i & 63) as u64);
+            }
+        }
+        Bitmap { words: w, len: n }
+    }
+
+    pub(pkg) fn get(self, i: usize) -> bool { (self.words[i >> 6] >> (i & 63) as u64) & 1u64 == 1u64 }
+
+    pub(pkg) fn set(self, i: usize, v: bool) {
+        let m = 1u64 << (i & 63) as u64;
+        if v {
+            self.words[i >> 6] = self.words[i >> 6] | m;
+        } else {
+            self.words[i >> 6] = self.words[i >> 6] & !m;
+        }
+    }
+
+    /// Append one flag.
+    pub(pkg) fn push(ref self, v: bool) {
+        if self.len & 63 == 0 {
+            self.words.push(0u64);
+        }
+        if v {
+            let i = self.len;
+            self.words[i >> 6] = self.words[i >> 6] | (1u64 << (i & 63) as u64);
+        }
+        self.len += 1;
+    }
+
+    /// The number of null rows.
+    pub(pkg) fn nulls(self) -> usize {
+        let ones: usize = 0;
+        let full = self.len >> 6;
+        for k in 0..full {
+            ones += self.words[k].count_ones() as usize;
+        }
+        let rest = self.len & 63;
+        if rest > 0 {
+            ones += (self.words[full] & ((1u64 << rest as u64) - 1u64)).count_ones() as usize;
+        }
+        self.len - ones
+    }
+
+    /// Rows `idx` in order.
+    pub(pkg) fn take(self, idx: List<usize>) -> Bitmap {
+        let out = Bitmap { words: List::filled((idx.len() + 63) / 64, 0u64), len: idx.len() };
+        for j in 0..idx.len() {
+            if self.get(idx[j]) {
+                out.words[j >> 6] = out.words[j >> 6] | (1u64 << (j & 63) as u64);
+            }
+        }
+        out
+    }
+
+    /// Rows `start..end`.
+    pub(pkg) fn slice(self, start: usize, end: usize) -> Bitmap {
+        let n = end - start;
+        let out = Bitmap { words: List::filled((n + 63) / 64, 0u64), len: n };
+        for j in 0..n {
+            if self.get(start + j) {
+                out.words[j >> 6] = out.words[j >> 6] | (1u64 << (j & 63) as u64);
+            }
+        }
+        out
+    }
+
+    /// Both valid, word by word.
+    pub(pkg) fn and(self, o: Bitmap) -> Bitmap {
+        let w: List<u64> = List::with_capacity(self.words.len());
+        for k in 0..self.words.len() {
+            w.push(self.words[k] & o.words[k]);
+        }
+        Bitmap { words: w, len: self.len }
+    }
+
+    /// `self` then `o`.
+    pub(pkg) fn concat(self, o: Bitmap) -> Bitmap {
+        let out = self.slice(0, self.len);
+        for i in 0..o.len {
+            out.push(o.get(i));
+        }
+        out
+    }
+}

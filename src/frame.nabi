@@ -1,0 +1,605 @@
+//! The table: named, ordered columns of one length, and the operations
+//! that only reshape rows or columns (selection, slicing, nulls).
+
+use pkg::column::Data;
+use pkg::column::bitmap::Bitmap;
+use pkg::{Column, DType, Expr, Field, Schema, TableError, Value};
+use core::array::Array;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+/// Named, ordered columns of equal length. Copies share the columns;
+/// every operation returns a new table and leaves its input as it was.
+///
+/// ```nabi
+/// use table::{col, Table};
+/// let t = table::table!{
+///     "city": ["Seoul", "Busan", "Seoul"],
+///     "temp": [21.5, 24.0, 19.0],
+/// };
+/// let warm = try t.filter(col("temp") .> 20.0) catch _ { t };
+/// assert(warm.nrows() == 2);
+/// ```
+#[derive(Clone)]
+pub struct Table {
+    pub(pkg) names: List<str>;
+    pub(pkg) cols: List<Column>;
+    pub(pkg) rows: usize;
+}
+
+/// One row of a table, read by column name.
+///
+/// ```nabi
+/// let t = table::table!{ "a": [1, 2], "b": ["x", "y"] };
+/// let r = t.row(1);
+/// assert(r.get("a") == table::Value::Int(2));
+/// assert(r.str("b") == "y");
+/// ```
+#[derive(Clone)]
+pub struct Row {
+    pub(pkg) t: Table;
+    pub(pkg) i: usize;
+}
+
+impl Row {
+    /// The row's position in its table.
+    pub fn index(self) -> usize { self.i }
+
+    /// The cell in column `name`; `Null` when there is no such column.
+    pub fn get(self, name: str) -> Value {
+        match self.t.find(name) {
+            k: usize => self.t.cols[k].get(self.i),
+            none => Value::Null,
+        }
+    }
+
+    /// The cell in column `k`.
+    pub fn at(self, k: usize) -> Value { self.t.cols[k].get(self.i) }
+
+    /// Column `name` as a number, `none` for null, text or a missing column.
+    pub fn f64(self, name: str) -> f64 | none { self.get(name).as_f64() }
+
+    /// Column `name` as an integer, `none` for null or another kind.
+    pub fn i64(self, name: str) -> i64 | none { self.get(name).as_i64() }
+
+    /// Column `name` as text; `""` for null or a non-text cell.
+    pub fn str(self, name: str) -> str { self.get(name).as_str() ?? "" }
+
+    /// Every cell, in column order.
+    pub fn values(self) -> List<Value> { List::from_fn(self.t.cols.len(), |k| self.at(k)) }
+}
+
+impl Table {
+    /// A table with no columns and no rows.
+    pub fn new() -> Table { Table { names: List::new(), cols: List::new(), rows: 0 } }
+
+    /// From `(name, column)` pairs; every column must have one length
+    /// and every name be new.
+    ///
+    /// ```nabi
+    /// use table::{Column, Table};
+    /// let t = try Table::from_columns([("x", Column::from([1, 2, 3]))]) catch _ { Table::new() };
+    /// assert(t.shape() == (3, 1));
+    /// ```
+    pub fn from_columns(cols: List<(str, Column)>) throws (TableError) -> Table {
+        let t = Table::new();
+        for (name, c) in cols {
+            t = try t.set_column(name, c, false);
+        }
+        t
+    }
+
+    /// Rows of cells against `names`; each column's type comes from its
+    /// cells (`Column::from_values`). A row of another length is an
+    /// error naming it.
+    ///
+    /// ```nabi
+    /// use table::Value;
+    /// let t = try table::Table::from_rows(["a", "b"], [[Value::Int(1), Value::Str("x")], [Value::Int(2), Value::Null]]) catch _ { table::Table::new() };
+    /// assert(t.column_at(1).null_count() == 1);
+    /// ```
+    pub fn from_rows(names: List<str>, rows: List<List<Value>>) throws (TableError) -> Table {
+        let n = names.len();
+        let cells: List<List<Value>> = List::from_fn(n, |_| List::with_capacity(rows.len()));
+        for r in 0..rows.len() {
+            let row = rows[r];
+            if row.len() != n {
+                throw TableError::RaggedRow { row: r, len: row.len(), expected: n };
+            }
+            for k in 0..n {
+                cells[k].push(row[k]);
+            }
+        }
+        let t = Table::new();
+        for k in 0..n {
+            let c = try Column::from_values(cells[k], none) catch e {
+                throw match e {
+                    TableError::Invalid { msg } => TableError::invalid(f"column `{names[k]}`: {msg}"),
+                    other => other,
+                };
+            };
+            t = try t.set_column(names[k], c, false);
+        }
+        t
+    }
+
+    /// The number of rows.
+    pub fn nrows(self) -> usize { self.rows }
+
+    /// The number of columns.
+    pub fn ncols(self) -> usize { self.cols.len() }
+
+    /// `(rows, columns)`.
+    pub fn shape(self) -> (usize, usize) { (self.rows, self.cols.len()) }
+
+    /// No rows.
+    pub fn is_empty(self) -> bool { self.rows == 0 }
+
+    /// The column names, in order.
+    pub fn names(self) -> List<str> { self.names.clone() }
+
+    /// Names and types.
+    pub fn schema(self) -> Schema {
+        Schema { fields: List::from_fn(self.cols.len(), |k| Field { name: self.names[k], dtype: self.cols[k].dtype() }) }
+    }
+
+    /// The columns, in order.
+    pub fn columns(self) -> List<Column> { self.cols.clone() }
+
+    pub(pkg) fn find(self, name: str) -> usize | none {
+        for k in 0..self.names.len() {
+            if self.names[k] == name { return k; }
+        }
+        none
+    }
+
+    /// The position of column `name`.
+    pub fn index_of(self, name: str) throws (TableError) -> usize {
+        self.find(name) ?? throw TableError::missing(name, self.names)
+    }
+
+    /// Whether there is a column `name`.
+    pub fn has(self, name: str) -> bool { !(self.find(name) is none) }
+
+    /// Column `name`; a missing name is an error that suggests the
+    /// closest one.
+    pub fn column(self, name: str) throws (TableError) -> Column { self.cols[try self.index_of(name)] }
+
+    /// Column `k` (panics past `ncols()`, as list indexing does).
+    pub fn column_at(self, k: usize) -> Column { self.cols[k] }
+
+    /// Column `name` as an `f64` array (no copy for an `f64` column
+    /// without nulls, so treat it as read-only; nulls read as NaN).
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1.0, 2.0, 3.0] };
+    /// let x = try t.f64("x") catch _ { [0.0] };
+    /// assert((x .* 2.0).sum() == 12.0);
+    /// ```
+    pub fn f64(self, name: str) throws (TableError) -> Array<f64, 1> {
+        try (try self.column(name)).to_f64() catch e { throw self.retag(e, name); }
+    }
+
+    /// Column `name` as an `i64` array (no copy, read-only).
+    pub fn i64(self, name: str) throws (TableError) -> Array<i64, 1> {
+        try (try self.column(name)).to_i64() catch e { throw self.retag(e, name); }
+    }
+
+    /// Put the column name into a type error from a `Column` method.
+    pub(pkg) fn retag(self, e: TableError, name: str) -> TableError {
+        match e {
+            TableError::TypeMismatch { column, expected, found } =>
+                TableError::TypeMismatch { column: if column == "" { name } else { column }, expected, found },
+            other => other,
+        }
+    }
+
+    /// Row `i` (panics past `nrows()`).
+    pub fn row(self, i: usize) -> Row {
+        if i >= self.rows { panic(f"row {i} out of range for a table of {self.rows} rows"); }
+        Row { t: self, i }
+    }
+
+    /// Every row, front to back.
+    pub fn rows(self) -> List<Row> { List::from_fn(self.rows, |i| Row { t: self, i }) }
+
+    /// The cell at row `i`, column `name`.
+    pub fn get(self, i: usize, name: str) throws (TableError) -> Value {
+        if i >= self.rows {
+            throw TableError::invalid(f"row {i} is out of range for {self.rows} rows; use an index below `nrows()`");
+        }
+        (try self.column(name)).get(i)
+    }
+
+    /// Add or replace a column. `replace` false makes an existing name
+    /// an error.
+    pub(pkg) fn set_column(self, name: str, c: Column, replace: bool) throws (TableError) -> Table {
+        if !self.cols.is_empty() && c.len() != self.rows {
+            throw TableError::LengthMismatch { column: name, len: c.len(), expected: self.rows };
+        }
+        let names = self.names.clone();
+        let cols = self.cols.clone();
+        match self.find(name) {
+            k: usize => {
+                if !replace { throw TableError::DuplicateColumn { name }; }
+                cols[k] = c;
+            },
+            none => {
+                names.push(name);
+                cols.push(c);
+            },
+        }
+        Table { names, cols, rows: c.len() }
+    }
+
+    /// The table with column `name` set to `c`: replaced in place when
+    /// it exists, else added at the end.
+    ///
+    /// ```nabi
+    /// use table::Column;
+    /// let t = table::table!{ "a": [1, 2] };
+    /// let u = try t.with("b", Column::from([true, false])) catch _ { t };
+    /// assert(u.names() == ["a", "b"]);
+    /// ```
+    pub fn with(self, name: str, c: Column) throws (TableError) -> Table { try self.set_column(name, c, true) }
+
+    /// The table with column `name` computed from `e` over this table
+    /// (replaced when it exists).
+    ///
+    /// ```nabi
+    /// use table::col;
+    /// let t = table::table!{ "x": [1.0, 2.0], "y": [10.0, 20.0] };
+    /// let u = try t.with_column("z", col("x") .* 2 .+ col("y")) catch _ { t };
+    /// assert(u.row(1).f64("z") == 24.0);
+    /// ```
+    pub fn with_column(self, name: str, e: Expr) throws (TableError) -> Table {
+        let c = try e.eval(self);
+        try self.set_column(name, c, true)
+    }
+
+    /// Several computed columns, each evaluated against this table.
+    pub fn with_columns(self, es: List<(str, Expr)>) throws (TableError) -> Table {
+        let cs: List<Column> = List::new();
+        for (_, e) in es {
+            cs.push(try e.eval(self));
+        }
+        let t = self;
+        for k in 0..es.len() {
+            t = try t.set_column(es[k].0, cs[k], true);
+        }
+        t
+    }
+
+    /// Only the columns `names`, in that order.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "a": [1], "b": [2], "c": [3] };
+    /// let u = try t.select(["c", "a"]) catch _ { t };
+    /// assert(u.names() == ["c", "a"]);
+    /// ```
+    pub fn select(self, names: List<str>) throws (TableError) -> Table {
+        let t = Table { names: List::new(), cols: List::new(), rows: self.rows };
+        for n in names {
+            if !(t.find(n) is none) { throw TableError::DuplicateColumn { name: n }; }
+            t.names.push(n);
+            t.cols.push(try self.column(n));
+        }
+        t
+    }
+
+    /// Every column except `names`.
+    pub fn drop(self, names: List<str>) throws (TableError) -> Table {
+        for n in names {
+            _ = try self.index_of(n);
+        }
+        let t = Table { names: List::new(), cols: List::new(), rows: self.rows };
+        for k in 0..self.cols.len() {
+            if !names.contains(self.names[k]) {
+                t.names.push(self.names[k]);
+                t.cols.push(self.cols[k]);
+            }
+        }
+        t
+    }
+
+    /// Rename columns by `(old, new)` pairs.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "a": [1] };
+    /// let u = try t.rename([("a", "id")]) catch _ { t };
+    /// assert(u.names() == ["id"]);
+    /// ```
+    pub fn rename(self, pairs: List<(str, str)>) throws (TableError) -> Table {
+        let names = self.names.clone();
+        for (old, new) in pairs {
+            let k = try self.index_of(old);
+            names[k] = new;
+        }
+        for i in 0..names.len() {
+            for j in 0..i {
+                if names[i] == names[j] { throw TableError::DuplicateColumn { name: names[i] }; }
+            }
+        }
+        Table { names, cols: self.cols, rows: self.rows }
+    }
+
+    /// The first `n` rows (all when there are fewer).
+    pub fn head(self, n: usize) -> Table { self.slice(0, n) }
+
+    /// The last `n` rows.
+    pub fn tail(self, n: usize) -> Table { self.slice(self.rows - n.min(self.rows), self.rows) }
+
+    /// Rows `start..end`, clamped to the table; the columns share their
+    /// buffers with this table.
+    pub fn slice(self, start: usize, end: usize) -> Table {
+        let e = end.min(self.rows);
+        let s = start.min(e);
+        Table { names: self.names, cols: self.cols.iter().map(|c| c.slice(s, e)).collect(), rows: e - s }
+    }
+
+    /// The rows at `idx`, in that order (repeats allowed). An index past
+    /// the end is an error.
+    pub fn take(self, idx: List<usize>) throws (TableError) -> Table {
+        for i in idx {
+            if i >= self.rows {
+                throw TableError::invalid(f"row {i} is out of range for {self.rows} rows");
+            }
+        }
+        self.take_unchecked(idx)
+    }
+
+    pub(pkg) fn take_unchecked(self, idx: List<usize>) -> Table {
+        Table { names: self.names, cols: self.cols.iter().map(|c| c.take(idx)).collect(), rows: idx.len() }
+    }
+
+    /// `n` rows drawn without replacement (all, shuffled, when `n` is at
+    /// least the row count), reproducible for one `seed`. Floyd's
+    /// algorithm: O(n) draws, kept in draw order.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "a": [1, 2, 3, 4, 5] };
+    /// assert(t.sample(3, 7).nrows() == 3);
+    /// ```
+    pub fn sample(self, n: usize, seed: u64) -> Table {
+        let rng = Xoshiro256PlusPlus::seed(seed);
+        let total = self.rows;
+        let k = n.min(total);
+        let picked: Set<usize> = Set::new();
+        let order: List<usize> = List::with_capacity(k);
+        for j in total - k..total {
+            let r = rng.below((j + 1) as u64) as usize;
+            if picked.contains(r) {
+                picked.insert(j);
+                order.push(j);
+            } else {
+                picked.insert(r);
+                order.push(r);
+            }
+        }
+        self.take_unchecked(order)
+    }
+
+    /// The rows where `e` is `true` (null counts as `false`).
+    ///
+    /// ```nabi
+    /// use table::col;
+    /// let t = table::table!{ "x": [1, 5, 3], "tag": ["a", "b", "a"] };
+    /// let u = try t.filter(col("x") .> 2 .&& col("tag") .== "a") catch _ { t };
+    /// assert(u.nrows() == 1);
+    /// ```
+    pub fn filter(self, e: Expr) throws (TableError) -> Table {
+        let c = try e.eval(self);
+        try self.filter_mask_column(c, "the filter expression")
+    }
+
+    /// The rows where boolean column `name` is `true`.
+    pub fn filter_by_column(self, name: str) throws (TableError) -> Table {
+        try self.filter_mask_column(try self.column(name), f"column `{name}`")
+    }
+
+    fn filter_mask_column(self, c: Column, what: str) throws (TableError) -> Table {
+        let m = match c.data {
+            Data::Bool(m) => m,
+            _ => throw TableError::invalid(f"{what} is {c.dtype()}, but filtering needs bool; compare it, as in `col(\"x\") .> 0`"),
+        };
+        let idx: List<usize> = List::new();
+        for i in 0..self.rows {
+            if m[i] && c.is_valid(i) { idx.push(i); }
+        }
+        self.take_unchecked(idx)
+    }
+
+    /// The rows where `mask` is `true`; its length must be the row count.
+    pub fn filter_mask(self, mask: Array<bool, 1>) throws (TableError) -> Table {
+        if mask.len() != self.rows {
+            throw TableError::LengthMismatch { column: "mask", len: mask.len(), expected: self.rows };
+        }
+        try self.filter_mask_column(Column::from_bool_array(mask), "the mask")
+    }
+
+    /// The rows for which `keep` is `true`.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "name": ["ann", "bob"] };
+    /// let u = t.filter_rows(|r| r.str("name").starts_with("b"));
+    /// assert(u.nrows() == 1);
+    /// ```
+    pub fn filter_rows(self, keep: fn(Row) -> bool) -> Table {
+        let idx: List<usize> = List::new();
+        for i in 0..self.rows {
+            if keep(Row { t: self, i }) { idx.push(i); }
+        }
+        self.take_unchecked(idx)
+    }
+
+    /// The table with the rows that have a null in any of `names`
+    /// removed (`none`: in any column).
+    pub fn drop_nulls(self, names: List<str> | none) throws (TableError) -> Table {
+        let ks: List<usize> = match names {
+            ns: List<str> => {
+                let out: List<usize> = List::new();
+                for n in ns { out.push(try self.index_of(n)); }
+                out
+            },
+            none => List::from_fn(self.cols.len(), |k| k),
+        };
+        let idx: List<usize> = List::new();
+        for i in 0..self.rows {
+            let ok = true;
+            for k in ks {
+                if self.cols[k].is_null(i) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok { idx.push(i); }
+        }
+        self.take_unchecked(idx)
+    }
+
+    /// The table with the nulls of column `name` replaced by `v`, which
+    /// must fit its type.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1.0, none, 3.0] };
+    /// let u = try t.fill_null("x", table::Value::Float(0.0)) catch _ { t };
+    /// assert(u.row(1).f64("x") == 0.0);
+    /// ```
+    pub fn fill_null(self, name: str, v: Value) throws (TableError) -> Table {
+        let c = try self.column(name);
+        let filled = try fill(c, v) catch _ {
+            let vt = v.dtype() ?? DType::Str;
+            throw TableError::invalid(f"column `{name}` is {c.dtype()}, so it cannot be filled with a {vt} value; pass a {c.dtype()} value");
+        };
+        try self.set_column(name, filled, true)
+    }
+
+    /// Nulls of column `name` replaced by the last value above them
+    /// (still null before the first value).
+    pub fn fill_forward(self, name: str) throws (TableError) -> Table {
+        let c = try self.column(name);
+        let idx: List<i64> = List::with_capacity(self.rows);
+        let last: i64 = -1;
+        for i in 0..self.rows {
+            if c.is_valid(i) { last = i as i64; }
+            idx.push(last);
+        }
+        try self.set_column(name, c.take_or_null(idx), true)
+    }
+
+    /// The table with column `name` converted to `t` (`Column::cast`).
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "zip": [1234, 501] };
+    /// let u = try t.cast("zip", table::DType::Str) catch _ { t };
+    /// assert(u.row(1).str("zip") == "501");
+    /// ```
+    pub fn cast(self, name: str, t: DType) throws (TableError) -> Table {
+        let c = try self.column(name);
+        try self.set_column(name, try c.cast(t) catch e { throw TableError::invalid(f"column `{name}`: {e}"); }, true)
+    }
+
+    /// This table's rows followed by `o`'s. Columns match by name (any
+    /// order); both tables need the same names.
+    ///
+    /// ```nabi
+    /// let a = table::table!{ "x": [1], "y": ["a"] };
+    /// let b = table::table!{ "y": ["b"], "x": [2] };
+    /// let c = try a.vstack(b) catch _ { a };
+    /// assert(c.nrows() == 2 && c.row(1).str("y") == "b");
+    /// ```
+    pub fn vstack(self, o: Table) throws (TableError) -> Table {
+        if self.cols.is_empty() { return o; }
+        if o.cols.is_empty() { return self; }
+        if o.cols.len() != self.cols.len() {
+            throw TableError::invalid(f"vstack: {self.cols.len()} columns against {o.cols.len()}; select the same columns on both sides first");
+        }
+        let cols: List<Column> = List::new();
+        for k in 0..self.cols.len() {
+            let other = try o.column(self.names[k]);
+            cols.push(try self.cols[k].concat(other) catch e { throw self.retag(e, self.names[k]); });
+        }
+        Table { names: self.names, cols, rows: self.rows + o.rows }
+    }
+
+    /// The columns of this table, then `o`'s; both need one row count
+    /// and distinct names.
+    pub fn hstack(self, o: Table) throws (TableError) -> Table {
+        let t = self;
+        for k in 0..o.cols.len() {
+            t = try t.set_column(o.names[k], o.cols[k], false);
+        }
+        t
+    }
+
+    /// The tables' rows, one after another (`vstack` of each).
+    pub fn concat(ts: List<Table>) throws (TableError) -> Table {
+        // Neighbours pairwise, so each row is copied O(log n) times.
+        let level = ts.clone();
+        while level.len() > 1 {
+            let next: List<Table> = List::with_capacity(level.len() / 2 + 1);
+            let i = 0usize;
+            while i + 1 < level.len() {
+                next.push(try level[i].vstack(level[i + 1]));
+                i += 2;
+            }
+            if i < level.len() { next.push(level[i]); }
+            level = next;
+        }
+        if level.is_empty() { Table::new() } else { level[0] }
+    }
+
+    /// Distinct rows, first occurrence kept, in order.
+    pub fn unique(self) -> Table {
+        let idx = pkg::keys::first_rows(self, List::from_fn(self.cols.len(), |k| k));
+        self.take_unchecked(idx)
+    }
+
+    /// Rows distinct in columns `names`, first occurrence kept.
+    pub fn unique_by(self, names: List<str>) throws (TableError) -> Table {
+        let ks: List<usize> = List::new();
+        for n in names { ks.push(try self.index_of(n)); }
+        self.take_unchecked(pkg::keys::first_rows(self, ks))
+    }
+}
+
+/// `c` with its nulls set to `v`.
+pub(pkg) fn fill(c: Column, v: Value) throws (TableError) -> Column {
+    let b = match c.valid {
+        b: Bitmap => b,
+        none => return c,
+    };
+    if v.is_null() { return c; }
+    let t = c.dtype();
+    let data = match (c.data, v) {
+        (Data::I64(a), Value::Int(x)) => Data::I64(List::from_fn(a.len(), |i| if b.get(i) { a[i] } else { x })),
+        (Data::F64(a), _) => {
+            let x = v.as_f64() ?? throw TableError::mismatch("", "a number", (v.dtype() ?? DType::Str).name());
+            Data::F64(List::from_fn(a.len(), |i| if b.get(i) { a[i] } else { x }))
+        },
+        (Data::Bool(a), Value::Bool(x)) => Data::Bool(List::from_fn(a.len(), |i| if b.get(i) { a[i] } else { x })),
+        (Data::Str(a), Value::Str(x)) => Data::Str(List::from_fn(a.len(), |i| if b.get(i) { a[i] } else { x })),
+        (Data::Cat(_, _), Value::Str(_)) => return try fill(c.decat(), v).to_cat(),
+        (Data::Date(a), Value::Date(x)) => Data::Date(List::from_fn(a.len(), |i| if b.get(i) { a[i] } else { x.days })),
+        (Data::DateTime(a), Value::DateTime(x)) => Data::DateTime(List::from_fn(a.len(), |i| if b.get(i) { a[i] } else { x.ns })),
+        _ => throw TableError::mismatch("", t.name(), (v.dtype() ?? DType::Str).name()),
+    };
+    Column::of(data)
+}
+
+/// Same column names in order, and equal columns (types and cells; a
+/// NaN equals nothing).
+///
+/// ```nabi
+/// let a = table::table!{ "x": [1, 2] };
+/// assert(a == table::table!{ "x": [1, 2] });
+/// assert(a != table::table!{ "y": [1, 2] });
+/// ```
+impl PartialEq for Table {
+    fn eq(self, o: Table) -> bool {
+        if self.names != o.names || self.rows != o.rows { return false; }
+        for k in 0..self.cols.len() {
+            if self.cols[k] != o.cols[k] { return false; }
+        }
+        true
+    }
+}

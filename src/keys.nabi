@@ -1,0 +1,368 @@
+// Row keys for grouping, joins and distinct: every key column becomes
+// an `i64` code per row (equal cells, equal codes), the codes hash into
+// one `u64` per row, and an open-addressing table maps hashes to group
+// ids. Strings are coded through one shared dictionary, so a group or
+// probe compares integers, never strings, and nothing is allocated per
+// row.
+
+use pkg::column::Data;
+use pkg::{Column, Table, TableError};
+
+/// The codes of one or more key columns over the same rows. A nullable
+/// column adds a validity code column, so null is a key of its own.
+#[derive(Clone)]
+pub(pkg) struct Codes {
+    pub(pkg) cols: List<List<i64>>;
+    /// Per row: some key cell is null (joins never match such rows).
+    pub(pkg) null: List<bool> | none;
+    pub(pkg) n: usize;
+}
+
+/// Shared string dictionary for coding text keys of two tables alike.
+pub(pkg) struct Dictionary {
+    ids: Dict<str, i64>;
+}
+
+impl Dictionary {
+    pub(pkg) fn new() -> Dictionary { Dictionary { ids: Dict::new() } }
+
+    pub(pkg) fn code(self, s: str) -> i64 {
+        match self.ids.get(s) {
+            c: i64 => c,
+            none => {
+                let c = self.ids.len() as i64;
+                _ = self.ids.insert(s, c);
+                c
+            },
+        }
+    }
+}
+
+/// `f64` bits with every NaN one value and -0.0 equal to 0.0.
+pub(pkg) fn fbits(x: f64) -> i64 {
+    if x.is_nan() { return 0x7FF8000000000000; }
+    if x == 0.0 { return 0; }
+    x.to_bits() as i64
+}
+
+/// The codes of `c`'s rows; `as_f64` codes an `i64` column as floats
+/// (to meet an `f64` key on the other side of a join).
+pub(pkg) fn code_column(c: Column, d: Dictionary, as_f64: bool) -> List<i64> {
+    let n = c.len();
+    match c.data {
+        Data::I64(a) => if as_f64 {
+            let out: List<i64> = List::with_capacity(n);
+            for x in a { out.push(fbits(x as f64)); }
+            out
+        } else {
+            a
+        },
+        Data::F64(a) => {
+            let out: List<i64> = List::with_capacity(n);
+            for x in a { out.push(fbits(x)); }
+            out
+        },
+        Data::Bool(a) => {
+            let out: List<i64> = List::with_capacity(n);
+            for x in a { out.push(if x { 1 } else { 0 }); }
+            out
+        },
+        Data::Str(a) => {
+            let out: List<i64> = List::with_capacity(n);
+            for i in 0..n { out.push(if c.is_null(i) { -1 } else { d.code(a[i]) }); }
+            out
+        },
+        Data::Cat(a, lv) => {
+            let map: List<i64> = List::with_capacity(lv.len());
+            for s in lv { map.push(d.code(s)); }
+            let out: List<i64> = List::with_capacity(n);
+            for i in 0..n { out.push(if c.is_null(i) { -1 } else { map[a[i] as usize] }); }
+            out
+        },
+        Data::Date(a) => {
+            let out: List<i64> = List::with_capacity(n);
+            for x in a { out.push(x as i64); }
+            out
+        },
+        Data::DateTime(a) => a,
+    }
+}
+
+/// The codes of columns `ks` of `t`. `null_keys` adds a validity code
+/// column per nullable key, making null a key value (grouping); joins
+/// leave it out and skip null rows instead.
+pub(pkg) fn codes(t: Table, ks: List<usize>, d: Dictionary, as_f64: List<bool>, null_keys: bool) -> Codes {
+    let cols: List<List<i64>> = List::new();
+    let null: List<bool> | none = none;
+    for j in 0..ks.len() {
+        let c = t.cols[ks[j]];
+        cols.push(code_column(c, d, as_f64[j]));
+        if c.null_count() > 0 {
+            let flags: List<i64> = List::with_capacity(t.rows);
+            let any = match null {
+                x: List<bool> => x,
+                none => List::filled(t.rows, false),
+            };
+            for i in 0..t.rows {
+                let v = c.is_valid(i);
+                flags.push(if v { 1 } else { 0 });
+                if !v { any[i] = true; }
+            }
+            if null_keys { cols.push(flags); }
+            null = any;
+        }
+    }
+    Codes { cols, null, n: t.rows }
+}
+
+/// Key columns of `t` and `u` coded into one space for a join; the
+/// types must agree pairwise (numbers with numbers, text with text).
+pub(pkg) fn pair_codes(t: Table, tk: List<usize>, u: Table, uk: List<usize>) throws (TableError) -> (Codes, Codes) {
+    let d = Dictionary::new();
+    let fl: List<bool> = List::new();
+    for j in 0..tk.len() {
+        let a = t.cols[tk[j]].dtype();
+        let b = u.cols[uk[j]].dtype();
+        let ok = a == b || (a.is_numeric() && b.is_numeric()) || (a.is_text() && b.is_text());
+        if !ok {
+            throw TableError::TypeMismatch { column: f"{t.names[tk[j]]} / {u.names[uk[j]]}", expected: a.name(), found: b.name() };
+        }
+        fl.push(a != b && a.is_numeric());
+    }
+    (codes(t, tk, d, fl, false), codes(u, uk, d, fl, false))
+}
+
+/// splitmix64's finalizer.
+pub(pkg) fn mix(x: u64) -> u64 {
+    let z = x;
+    z = (z ^ (z >> 30u64)).wrapping_mul(0xBF58476D1CE4E5B9u64);
+    z = (z ^ (z >> 27u64)).wrapping_mul(0x94D049BB133111EBu64);
+    z ^ (z >> 31u64)
+}
+
+/// One hash per row over all code columns, a column at a time.
+pub(pkg) fn hashes(c: Codes) -> List<u64> {
+    let h: List<u64> = List::filled(c.n, 0x9E3779B97F4A7C15u64);
+    for col in c.cols {
+        for i in 0..c.n {
+            h[i] = mix(h[i] ^ (col[i] as u64)).wrapping_add(h[i].rotate_left(5u32));
+        }
+    }
+    h
+}
+
+/// Open-addressing map from rows to group ids. A slot holds `gid + 1`
+/// (0 is empty); groups remember their hash and first row.
+pub(pkg) struct Index {
+    slots: List<u32>;
+    mask: usize;
+    pub(pkg) hash: List<u64>;
+    pub(pkg) first: List<usize>;
+    /// The key of each group when there is one code column (`group` /
+    /// `find` then compare it directly).
+    pub(pkg) key: List<i64>;
+}
+
+impl Index {
+    pub(pkg) fn new(expect: usize) -> Index {
+        let cap: usize = 16;
+        while cap < expect * 2 { cap *= 2; }
+        Index { slots: List::filled(cap, 0u32), mask: cap - 1, hash: List::with_capacity(expect), first: List::with_capacity(expect), key: List::new() }
+    }
+
+    /// A new group for row `row` with hash `h`, known to be absent.
+    pub(pkg) fn add(ref self, h: u64, row: usize) {
+        let g = self.first.len();
+        self.hash.push(h);
+        self.first.push(row);
+        if (g + 1) * 2 > self.mask + 1 {
+            let cap = (self.mask + 1) * 2;
+            self.slots = List::filled(cap, 0u32);
+            self.mask = cap - 1;
+            for k in 0..self.hash.len() {
+                let q = (self.hash[k] as usize) & self.mask;
+                while self.slots[q] != 0u32 { q = (q + 1) & self.mask; }
+                self.slots[q] = (k + 1) as u32;
+            }
+            return;
+        }
+        let q = (h as usize) & self.mask;
+        while self.slots[q] != 0u32 { q = (q + 1) & self.mask; }
+        self.slots[q] = (g + 1) as u32;
+    }
+
+    /// The group whose key equals row `i` of `other` (codes in the same
+    /// space as `mine`), or -1.
+    pub(pkg) fn find(self, h: u64, mine: Codes, other: Codes, i: usize) -> i64 {
+        let p = (h as usize) & self.mask;
+        if self.key.len() == self.first.len() && other.cols.len() == 1 {
+            let x = other.cols[0][i];
+            let slots = self.slots;
+            let key = self.key;
+            loop {
+                let s = slots[p];
+                if s == 0u32 { return -1; }
+                let g = (s - 1u32) as usize;
+                if key[g] == x { return g as i64; }
+                p = (p + 1) & self.mask;
+            }
+        }
+        loop {
+            let s = self.slots[p];
+            if s == 0u32 { return -1; }
+            let g = (s - 1u32) as usize;
+            if self.hash[g] == h && same(mine, self.first[g], other, i) {
+                return g as i64;
+            }
+            p = (p + 1) & self.mask;
+        }
+    }
+}
+
+/// Row `i` of `a` and row `j` of `b` have equal codes.
+pub(pkg) fn same(a: Codes, i: usize, b: Codes, j: usize) -> bool {
+    for k in 0..a.cols.len() {
+        if a.cols[k][i] != b.cols[k][j] { return false; }
+    }
+    true
+}
+
+/// Group id per row and each group's first row, groups in order of
+/// first appearance.
+pub(pkg) fn group(c: Codes) -> (List<u32>, Index) {
+    if c.cols.len() == 1 { return group_one(c); }
+    let hs = hashes(c);
+    let cols = c.cols;
+    let nk = cols.len();
+    let n = c.n;
+    let ix = Index::new(1024.min(n + 1));
+    let gid: List<u32> = List::with_capacity(n);
+    let slots = ix.slots;
+    let mask = ix.mask;
+    let hash: List<u64> = List::new();
+    let first: List<usize> = List::new();
+    for i in 0..n {
+        let h = hs[i];
+        let p = (h as usize) & mask;
+        loop {
+            let s = slots[p];
+            if s == 0u32 {
+                let g = first.len();
+                slots[p] = (g + 1) as u32;
+                hash.push(h);
+                first.push(i);
+                gid.push(g as u32);
+                if (g + 1) * 2 > mask + 1 {
+                    let cap = (mask + 1) * 2;
+                    slots = List::filled(cap, 0u32);
+                    mask = cap - 1;
+                    for k in 0..hash.len() {
+                        let q = (hash[k] as usize) & mask;
+                        while slots[q] != 0u32 { q = (q + 1) & mask; }
+                        slots[q] = (k + 1) as u32;
+                    }
+                }
+                break;
+            }
+            let g = (s - 1u32) as usize;
+            if hash[g] == h {
+                let r = first[g];
+                let eq = true;
+                for k in 0..nk {
+                    let col = cols[k];
+                    if col[r] != col[i] {
+                        eq = false;
+                        break;
+                    }
+                }
+                if eq {
+                    gid.push(g as u32);
+                    break;
+                }
+            }
+            p = (p + 1) & mask;
+        }
+    }
+    ix.slots = slots;
+    ix.mask = mask;
+    ix.hash = hash;
+    ix.first = first;
+    (gid, ix)
+}
+
+/// `group` for one code column: the probe compares keys, no hashes
+/// list and no per-row calls.
+fn group_one(c: Codes) -> (List<u32>, Index) {
+    let col = c.cols[0];
+    let n = c.n;
+    let ix = Index::new(1024.min(n + 1));
+    let gid: List<u32> = List::with_capacity(n);
+    let slots = ix.slots;
+    let mask = ix.mask;
+    let key: List<i64> = List::new();
+    let hash: List<u64> = List::new();
+    let first: List<usize> = List::new();
+    for i in 0..n {
+        let x = col[i];
+        let h = one_hash(x);
+        let p = (h as usize) & mask;
+        loop {
+            let s = slots[p];
+            if s == 0u32 {
+                let g = key.len();
+                slots[p] = (g + 1) as u32;
+                key.push(x);
+                hash.push(h);
+                first.push(i);
+                gid.push(g as u32);
+                if (g + 1) * 2 > mask + 1 {
+                    // Double and reinsert every group.
+                    let cap = (mask + 1) * 2;
+                    slots = List::filled(cap, 0u32);
+                    mask = cap - 1;
+                    for k in 0..hash.len() {
+                        let q = (hash[k] as usize) & mask;
+                        while slots[q] != 0u32 { q = (q + 1) & mask; }
+                        slots[q] = (k + 1) as u32;
+                    }
+                }
+                break;
+            }
+            let g = s - 1u32;
+            if key[g as usize] == x {
+                gid.push(g);
+                break;
+            }
+            p = (p + 1) & mask;
+        }
+    }
+    ix.slots = slots;
+    ix.mask = mask;
+    ix.key = key;
+    ix.hash = hash;
+    ix.first = first;
+    (gid, ix)
+}
+
+/// The hash `hashes` gives a row with one code column.
+pub(pkg) fn one_hash(x: i64) -> u64 {
+    let h = 0x9E3779B97F4A7C15u64;
+    mix(h ^ (x as u64)).wrapping_add(h.rotate_left(5u32))
+}
+
+/// The first row of each distinct key over columns `ks`, in order.
+pub(pkg) fn first_rows(t: Table, ks: List<usize>) -> List<usize> {
+    if ks.is_empty() {
+        return if t.rows > 0 { [0] } else { List::new() };
+    }
+    let fl: List<bool> = List::filled(ks.len(), false);
+    let (_, ix) = group(codes(t, ks, Dictionary::new(), fl, true));
+    ix.first
+}
+
+/// Positions of the columns `names` in `t`.
+pub(pkg) fn positions(t: Table, names: List<str>) throws (TableError) -> List<usize> {
+    let out: List<usize> = List::new();
+    for n in names { out.push(try t.index_of(n)); }
+    out
+}

@@ -1,0 +1,122 @@
+// Arrow IPC: round trips of every type with nulls, batches, the stream
+// format, projection, and errors on cut or foreign data.
+
+use pkg::{Arrow, Column, DType, Table, Value};
+
+fn sample() -> Table {
+    let t = pkg::table!{
+        "id": [1, 2, 3, -4],
+        "x": [0.5, none, -2.25, 1e300],
+        "ok": [true, false, none, true],
+        "s": ["a", "", none, "é한"],
+        "d": [date"2024-01-01", none, date"1969-12-31", date"2000-02-29"],
+        "t": [datetime"2024-01-01T10:30:00", datetime"1960-01-01T00:00:00", none, datetime"2024-02-29T23:59:59"],
+    };
+    try! t.with("c", Column::cat(["red", "blue", "red", "green"]))
+}
+
+fn back(t: Table, a: Arrow) -> Table { try a.read_bytes(a.write_bytes(t)) catch e { panic(f"{e}"); } }
+
+#[test]
+fn round_trip_types() {
+    let t = sample();
+    let r = back(t, Arrow::new());
+    assert(r == t);
+    assert(r.dtypes() == t.dtypes());
+    assert((try! r.column("c")).levels() == ["red", "blue", "green"]);
+    assert((try! r.column("x")).null_count() == 1 && (try! r.column("s")).null_count() == 1);
+}
+
+#[test]
+fn batches_and_stream() {
+    let t = sample();
+    for n in [1usize, 3, 4, 100] {
+        assert(back(t, Arrow::new().batch_rows(n)) == t);
+        assert(back(t, Arrow::new().stream(true).batch_rows(n)) == t);
+    }
+    let big = try! Table::from_columns([("i", Column::from(List::from_fn(1000, |i| i as i64))), ("f", Column::from(List::from_fn(1000, |i| -> f64 | none { if i % 7 == 0 { none } else { i as f64 * 0.5 } })))]);
+    assert(back(big, Arrow::new().batch_rows(128)) == big);
+}
+
+#[test]
+fn empty_tables() {
+    let e = try! Table::from_columns([("a", Column::i64s([])), ("b", Column::strs([]))]);
+    let r = back(e, Arrow::new());
+    assert(r.shape() == (0, 2) && r.dtypes() == [DType::I64, DType::Str]);
+    assert(back(Table::new(), Arrow::new()).shape() == (0, 0));
+}
+
+#[test]
+fn projection() {
+    let t = sample();
+    let b = Arrow::new().write_bytes(t);
+    let p = try! Arrow::new().columns(["t", "id"]).read_bytes(b);
+    assert(p.names() == ["t", "id"] && p == try! t.select(["t", "id"]));
+    let msg = "";
+    try Arrow::new().columns(["nope"]).read_bytes(b) catch e { msg = e.message(); };
+    assert(msg.contains("no column `nope`"), msg);
+    let s = try! pkg::arrow_schema(b);
+    assert(s.names() == t.names() && s.dtype("c") == DType::Cat);
+}
+
+#[test]
+fn bad_data_is_an_error() {
+    let b = Arrow::new().write_bytes(sample());
+    for cut in [0usize, 5, 12, b.len() / 2, b.len() - 3] {
+        let part = b[0:cut].to_list();
+        let r = try? Arrow::new().read_bytes(part);
+        assert(r is none, f"cut at {cut}");
+    }
+    let s = Arrow::new().stream(true).write_bytes(sample());
+    for cut in [3usize, 40, s.len() / 3] {
+        let r = try? Arrow::new().read_bytes(s[0:cut].to_list());
+        // A stream cut between messages is the batches before the cut.
+        if let t: Table = r { assert(t.nrows() <= 4); }
+    }
+    let junk: List<u8> = List::from_fn(64, |i| (i * 37 % 251) as u8);
+    assert((try? Arrow::new().read_bytes(junk)) is none);
+    let _ = Value::Null;
+}
+
+// tests/data/mixed.arrow{,s}: written by an independent encoder in
+// pyarrow's layout (64-byte aligned buffers, vtables after their
+// tables, no validity buffer without nulls): int8, uint16, float32,
+// float16, large_utf8, date64, timestamp[ms, UTC], a utf8 dictionary
+// with int8 indices (a delta batch in the stream), the null type, a
+// struct and bool; two record batches. mixed-zstd.arrow has every
+// buffer ZSTD-compressed (by the zstd tool).
+fn fixture(name: str, cols: List<str>) -> Table {
+    let path = f"tests/data/{name}";
+    try Arrow::new().columns(cols).read_file(path) catch e { panic(f"{name}: {e}"); }
+}
+
+const FLAT: [str; 10] = ["i8", "u16", "f32", "h", "ls", "d64", "ts", "cat", "nul", "b"];
+
+fn expected() -> Table {
+    let t = pkg::table!{
+        "i8": [-128, none, 127, 5],
+        "u16": [65535, 0, 7, 1],
+        "f32": [1.5, none, -0.25, 2.0],
+        "h": [0.5, -2.0, 65504.0, 1.0],
+        "ls": ["x", none, "yz", ""],
+        "d64": [date"1970-01-02", date"1969-12-31", date"1970-01-01", date"1970-01-03"],
+        "ts": [datetime"1970-01-01T00:00:01", none, datetime"1969-12-31T23:59:58.500", datetime"1970-01-01T00:00:00.003"],
+    };
+    let t = try! t.with("cat", try! pkg::column!["hi", "lo", none, "mid"].cast(DType::Cat));
+    let t = try! t.with("nul", Column::nulls(DType::F64, 4));
+    try! t.with("b", pkg::column![true, none, false, true])
+}
+
+#[test]
+fn foreign_layout() {
+    let want = expected();
+    for name in ["mixed.arrow", "mixed.arrows", "mixed-zstd.arrow"] {
+        let t = fixture(name, FLAT.to_list());
+        assert(t == want, f"{name}:\n{t}");
+        assert((try! t.column("cat")).levels() == ["lo", "hi", "mid"]);
+        assert(fixture(name, ["b"]) == try! want.select(["b"]));
+        let msg = "";
+        try Arrow::new().read_file(f"tests/data/{name}") catch e { msg = e.message(); };
+        assert(msg.contains("`st` is struct"), msg);
+    }
+}

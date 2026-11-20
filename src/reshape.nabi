@@ -1,0 +1,99 @@
+//! Long <-> wide: `pivot` spreads one column's values into columns,
+//! `melt` stacks columns into (variable, value) rows.
+
+use pkg::column::Data;
+use pkg::group::from_cells;
+use pkg::keys;
+use pkg::{Agg, AggKind, Column, DType, Table, TableError, Value};
+
+impl Table {
+    /// One row per distinct `index` key, one column per distinct value
+    /// of `columns` (named by its text, in order of first appearance),
+    /// each cell `agg` of the `values` rows with that pair; null where
+    /// there are none.
+    ///
+    /// ```nabi
+    /// use table::AggKind;
+    /// let t = table::table!{
+    ///     "day": ["mon", "mon", "tue"],
+    ///     "city": ["A", "B", "A"],
+    ///     "temp": [20.0, 25.0, 22.0],
+    /// };
+    /// let p = try t.pivot(["day"], "city", "temp", AggKind::Mean) catch _ { t };
+    /// assert(p.names() == ["day", "A", "B"]);
+    /// assert(p.row(1).f64("B") is none);
+    /// ```
+    pub fn pivot(self, index: List<str>, columns: str, values: str, agg: AggKind) throws (TableError) -> Table {
+        if agg == AggKind::Custom {
+            throw TableError::invalid("pivot takes a built-in aggregation; group with `group_by(..).agg([custom(..)])`, then pivot with `AggKind::First`");
+        }
+        let gi = try self.group_by(index);
+        let ci = try self.group_by([columns]);
+        let both: List<str> = index.clone();
+        both.push(columns);
+        let a = Agg { kind: agg, column: values, name: "v", q: 0.5, f: |_| Value::Null };
+        let gb = try self.group_by(both);
+        let cells = try gb.agg([a]);
+        let vcol = cells.cols[cells.cols.len() - 1];
+        let ni = gi.first.len();
+        let nc = ci.first.len();
+        // Each (index, column) group maps to its cell by the group ids of
+        // its first row.
+        let grid: List<Value> = List::filled(ni * nc, Value::Null);
+        for g in 0..gb.first.len() {
+            let r = gb.first[g];
+            grid[gi.gid[r] as usize * nc + ci.gid[r] as usize] = vcol.get(g);
+        }
+        let out = Table::new();
+        for k in gi.keys {
+            out = try out.set_column(self.names[k], self.cols[k].take(gi.first), false);
+        }
+        let cc = try self.column(columns);
+        let dt = vcol.dtype();
+        for j in 0..nc {
+            let label = f"{cc.get(ci.first[j])}";
+            let vs: List<Value> = List::from_fn(ni, |i| grid[i * nc + j]);
+            out = try out.set_column(label, try from_cells(vs, dt), false);
+        }
+        out
+    }
+
+    /// Stack the columns `value_vars` (`none`: every column not in
+    /// `id_vars`) into two: `variable` with the column name and `value`
+    /// with its cell, the `id_vars` repeated. Rows go column by column.
+    /// The value columns need one type (`i64` with `f64` gives `f64`).
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "id": [1, 2], "a": [10, 20], "b": [30, 40] };
+    /// let m = try t.melt(["id"], none) catch _ { t };
+    /// assert(m.names() == ["id", "variable", "value"]);
+    /// assert(m.nrows() == 4 && m.row(2).str("variable") == "b");
+    /// ```
+    pub fn melt(self, id_vars: List<str>, value_vars: List<str> | none) throws (TableError) -> Table {
+        let ids = try keys::positions(self, id_vars);
+        let vals: List<usize> = match value_vars {
+            vs: List<str> => try keys::positions(self, vs),
+            none => List::from_fn(self.cols.len(), |k| k).iter().filter(|k| !ids.contains(k)).collect(),
+        };
+        let n = self.rows;
+        let m = vals.len();
+        let repeat: List<usize> = List::with_capacity(n * m);
+        for _ in 0..m {
+            for i in 0..n { repeat.push(i); }
+        }
+        let out = Table::new();
+        for k in ids {
+            out = try out.set_column(self.names[k], self.cols[k].take(repeat), false);
+        }
+        let names: List<str> = List::with_capacity(n * m);
+        for k in vals {
+            for _ in 0..n { names.push(self.names[k]); }
+        }
+        out = try out.set_column("variable", Column::of(Data::Str(names)), false);
+        let value: Column = if m == 0 { Column::nulls(DType::F64, 0) } else { self.cols[vals[0]] };
+        for j in 1..m {
+            value = try value.concat(self.cols[vals[j]]) catch e { throw self.retag(e, self.names[vals[j]]); };
+        }
+        try out.set_column("value", value, false)
+    }
+}

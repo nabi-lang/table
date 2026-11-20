@@ -1,0 +1,188 @@
+//! Relational algebra as operators: the join symbols of Codd's algebra
+//! (`⋈ ⟕ ⟖ ⟗ ⋉ ▷`), the set operators (`∪ ∩` from core, `∖` here) and
+//! indexing by column name. The joins bind like `*`, the set operators
+//! like `+` / `-`, so `a ⋈ b ∪ c` is `(a ⋈ b) ∪ c`.
+//!
+//! Operators cannot throw, so where `Table::join` would throw these
+//! panic with the same message; call the methods when the column names
+//! come from data.
+
+use pkg::keys;
+use pkg::keys::Dictionary;
+use pkg::{Column, Expr, How, Table};
+
+/// A table with the key columns to join it on: `b.on(["id"])`.
+pub struct Keyed {
+    pub(pkg) t: Table;
+    pub(pkg) keys: List<str>;
+}
+
+impl Table {
+    /// This table keyed by `names`, the right side of a join operator.
+    ///
+    /// ```nabi
+    /// let a = table::table!{ "id": [1, 2], "x": [1.0, 2.0] };
+    /// let b = table::table!{ "id": [2, 3], "y": ["b", "c"] };
+    /// let j = a ⋈ b.on(["id"]);
+    /// assert(j.nrows() == 1 && j.row(0).str("y") == "b");
+    /// ```
+    pub fn on(self, names: List<str>) -> Keyed { Keyed { t: self, keys: names } }
+
+    /// The names this table shares with `o`: the keys of a natural join.
+    pub fn common_names(self, o: Table) -> List<str> {
+        self.names.iter().filter(|n| o.has(n)).collect()
+    }
+}
+
+/// The right side of a join operator: a whole table (a natural join on
+/// the shared names) or a keyed one.
+pub trait JoinSide {
+    /// The table and the key names, given the left table.
+    fn side(self, left: Table) -> (Table, List<str>);
+}
+
+impl JoinSide for Table {
+    fn side(self, left: Table) -> (Table, List<str>) { (self, left.common_names(self)) }
+}
+
+impl JoinSide for Keyed {
+    fn side(self, _left: Table) -> (Table, List<str>) { (self.t, self.keys) }
+}
+
+fn run<R: JoinSide>(l: Table, r: R, how: How, op: str) -> Table {
+    let (t, ks) = r.side(l);
+    if ks.is_empty() {
+        panic(f"`{op}`: the tables share no column name to join on; name the keys with `b.on([..])`");
+    }
+    try l.join(t, ks, how) catch e { panic(f"`{op}`: {e}"); }
+}
+
+/// Joins as operators. With a plain table on the right the keys are
+/// the shared column names (a natural join); `b.on(["k"])` names them.
+///
+/// | Operator | Join       | Method                    |
+/// |----------|------------|---------------------------|
+/// | `a ⋈ b`  | inner      | `a.join(b, ks, How::Inner)` |
+/// | `a ⟕ b`  | left outer | `How::Left`               |
+/// | `a ⟖ b`  | right outer| `How::Right`              |
+/// | `a ⟗ b`  | full outer | `How::Outer`              |
+/// | `a ⋉ b`  | semi       | `How::Semi`               |
+/// | `a ▷ b`  | anti       | `How::Anti`               |
+///
+/// ```nabi
+/// let people = table::table!{ "id": [1, 2, 3], "name": ["ann", "bob", "cy"] };
+/// let orders = table::table!{ "id": [1, 1, 3], "amount": [5.0, 7.0, 2.0] };
+/// assert((people ⋈ orders).nrows() == 3);
+/// assert((people ⟕ orders).nrows() == 4);
+/// assert((people ⋉ orders).nrows() == 2);
+/// assert((people ▷ orders).row(0).str("name") == "bob");
+/// ```
+pub trait Relational<Rhs> {
+    /// `self ⋈ rhs`: inner join.
+    #[infix("⋈", like = "*")]
+    fn inner_join(self, rhs: Rhs) -> Table;
+    /// `self ⟕ rhs`: left outer join.
+    #[infix("⟕", like = "*")]
+    fn left_join(self, rhs: Rhs) -> Table;
+    /// `self ⟖ rhs`: right outer join.
+    #[infix("⟖", like = "*")]
+    fn right_join(self, rhs: Rhs) -> Table;
+    /// `self ⟗ rhs`: full outer join.
+    #[infix("⟗", like = "*")]
+    fn outer_join(self, rhs: Rhs) -> Table;
+    /// `self ⋉ rhs`: left semi-join, rows of `self` with a match.
+    #[infix("⋉", like = "*")]
+    fn semi_join(self, rhs: Rhs) -> Table;
+    /// `self ▷ rhs`: anti-join, rows of `self` with no match.
+    #[infix("▷", like = "*")]
+    fn anti_join(self, rhs: Rhs) -> Table;
+}
+
+impl<R: JoinSide> Relational<R> for Table {
+    fn inner_join(self, rhs: R) -> Table { run(self, rhs, How::Inner, "⋈") }
+    fn left_join(self, rhs: R) -> Table { run(self, rhs, How::Left, "⟕") }
+    fn right_join(self, rhs: R) -> Table { run(self, rhs, How::Right, "⟖") }
+    fn outer_join(self, rhs: R) -> Table { run(self, rhs, How::Outer, "⟗") }
+    fn semi_join(self, rhs: R) -> Table { run(self, rhs, How::Semi, "⋉") }
+    fn anti_join(self, rhs: R) -> Table { run(self, rhs, How::Anti, "▷") }
+}
+
+/// `∖`: set difference.
+pub trait Difference<Rhs = Self> {
+    type Output;
+    /// `self ∖ rhs`.
+    #[infix("∖", like = "-")]
+    fn difference(self, rhs: Rhs) -> Output;
+}
+
+/// Which distinct rows of `a` also occur in `b` (whole rows, columns
+/// matched by name, null equal to null), first occurrences in order.
+fn shared_rows(a: Table, b: Table, want: bool, op: str) -> Table {
+    let all = try a.vstack(b) catch e { panic(f"`{op}`: {e}"); };
+    let ks: List<usize> = List::from_fn(all.cols.len(), |k| k);
+    let (gid, ix) = keys::codes(all, ks, Dictionary::new(), List::filled(ks.len(), false), true) |> keys::group;
+    let inb: List<bool> = List::filled(ix.first.len(), false);
+    for i in a.rows..all.rows { inb[gid[i] as usize] = true; }
+    let keep: List<usize> = List::new();
+    for g in 0..ix.first.len() {
+        let r = ix.first[g];
+        if r < a.rows && inb[g] == want { keep.push(r); }
+    }
+    a.take_unchecked(keep)
+}
+
+/// `a ∪ b`: the distinct rows of both, `a`'s first.
+///
+/// ```nabi
+/// let a = table::table!{ "x": [1, 2, 2] };
+/// let b = table::table!{ "x": [2, 3] };
+/// assert((a ∪ b).nrows() == 3);
+/// assert((a ∩ b).nrows() == 1);
+/// assert((a ∖ b).column_at(0).to_options_i64() == [1]);
+/// ```
+impl ops::Union for Table {
+    type Output = Table;
+    fn union(self, rhs: Table) -> Table { (try self.vstack(rhs) catch e { panic(f"`∪`: {e}"); }).unique() }
+}
+
+/// `a ∩ b`: the distinct rows of `a` that `b` has too.
+impl ops::Intersect for Table {
+    type Output = Table;
+    fn intersection(self, rhs: Table) -> Table { shared_rows(self, rhs, true, "∩") }
+}
+
+/// `a ∖ b`: the distinct rows of `a` that `b` does not have.
+impl Difference for Table {
+    type Output = Table;
+    fn difference(self, rhs: Table) -> Table { shared_rows(self, rhs, false, "∖") }
+}
+
+/// `t["name"]`: the column (panics on a missing name, with the closest
+/// one suggested; `t.column(..)` returns the error instead).
+///
+/// ```nabi
+/// let t = table::table!{ "x": [1, 2] };
+/// assert(t["x"].len() == 2);
+/// ```
+impl index::Index<str> for Table {
+    type Output = Column;
+    fn index(self, name: str) -> Column { try self.column(name) catch e { panic(f"{e}"); } }
+}
+
+/// `t[["a", "b"]]`: those columns, in that order.
+impl index::Index<List<str>> for Table {
+    type Output = Table;
+    fn index(self, names: List<str>) -> Table { try self.select(names) catch e { panic(f"{e}"); } }
+}
+
+/// `t[col("x") .> 0]`: the rows where the expression is `true`.
+///
+/// ```nabi
+/// use table::col;
+/// let t = table::table!{ "x": [-1, 2, 3] };
+/// assert(t[col("x") .> 0].nrows() == 2);
+/// ```
+impl index::Index<Expr> for Table {
+    type Output = Table;
+    fn index(self, e: Expr) -> Table { try self.filter(e) catch e2 { panic(f"{e2}"); } }
+}

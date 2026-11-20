@@ -1,0 +1,123 @@
+// Lazy queries: every plan shape gives what the unoptimized plan
+// gives; filters and projections land where they should; scans skip
+// row groups and stop at limits.
+
+use pkg::{Arrow, Column, Csv, How, Parquet, Query, Table, asc, col, count, desc, mean, sum};
+use std::{env, fs};
+
+fn data() -> Table {
+    let n = 200usize;
+    try! Table::from_columns([
+        ("id", Column::from(List::from_fn(n, |i| i as i64))),
+        ("g", Column::from(List::from_fn(n, |i| ["a", "b", "c", "d"][i % 4]))),
+        ("x", Column::from(List::from_fn(n, |i| -> f64 | none { if i % 9 == 0 { none } else { (i * 37 % 101) as f64 * 0.5 } }))),
+        ("y", Column::from(List::from_fn(n, |i| (i * 13 % 17) as i64 - 8))),
+    ])
+}
+
+fn other() -> Table {
+    pkg::table!{ "g": ["a", "b", "z"], "w": [1.5, 2.5, 3.5], "x": [10.0, 20.0, 30.0] }
+}
+
+fn same(q: Query) {
+    let a = try q.collect() catch e { panic(f"optimized: {e}\n{q.explain_unoptimized()}"); };
+    let b = try q.collect_unoptimized() catch e { panic(f"plain: {e}"); };
+    assert(a == b, f"plans differ:\n{try! q.explain()}\n--\n{a}\n--\n{b}");
+}
+
+fn queries(src: Query) -> List<Query> {
+    [
+        src.filter(col("x") .> 20.0).select(["id", "g"]),
+        src.select(["g", "x"]).filter(col("x") .> 10.0 .&& col("g") .!= "b").limit(7),
+        src.with_column("z", col("x") .* 2).filter(col("z") .> 40.0 .&& col("y") .< 0).select(["z", "id"]),
+        src.with_column("r", col("y").cum_sum()).filter(col("y") .> 0),
+        src.filter(col("y") .> 0).with_column("r", col("y").cum_sum()).select(["r"]),
+        src.filter(col("y").shift(1) .> 0),
+        src.group_by(["g"]).agg([count(), mean("x"), sum("y")]).filter(col("g") .!= "a" .&& col("count") .> 10).sort([desc("y_sum")]),
+        src.sort([asc("y"), desc("id")]).filter(col("g") .== "c").limit(5),
+        src.limit(30).filter(col("x") .> 10.0),
+        src.join(other().lazy(), ["g"], How::Inner).filter(col("w") .> 2.0 .&& col("y") .>= 0 .&& col("x_right") .< 25.0).select(["id", "w", "x_right"]),
+        src.join(other().lazy(), ["g"], How::Left).filter(col("w") .> 2.0 .|| col("w").is_null()).select(["id", "w"]),
+        src.join(other().lazy(), ["g"], How::Outer).filter(col("g") .== "z"),
+        src.join(other().lazy(), ["g"], How::Right).filter(col("y") .> 3),
+        src.join(other().lazy(), ["g"], How::Semi).filter(col("y") .> 3).select(["id"]),
+        src.join(other().lazy(), ["g"], How::Anti).filter(col("id") .< 50),
+        src.filter(col("x").is_null()).select(["id"]),
+        src.filter(5 .< col("y")),
+        src.with_columns([("a", col("x") .+ 1), ("b", col("y") .* 2)]).select(["b"]),
+    ]
+}
+
+#[test]
+fn table_source() {
+    for q in queries(data().lazy()) {
+        same(q);
+    }
+}
+
+fn tmp(name: str) -> str { f"{env::temp_dir()}/table-lazy-{name}" }
+
+#[test]
+fn file_sources() {
+    let t = data();
+    let pq = tmp("t.parquet");
+    let ar = tmp("t.arrow");
+    let cs = tmp("t.csv");
+    try! Parquet::new().row_group_rows(32).write_file(t, pq);
+    try! Arrow::new().batch_rows(50).write_file(t, ar);
+    try! Csv::new().write_file(t, cs);
+    for src in [Parquet::new().scan(pq), Arrow::new().scan(ar), Csv::new().batch_rows(17).scan(cs)] {
+        for q in queries(src) {
+            same(q);
+        }
+        assert(try! src.collect() == try! src.collect_unoptimized());
+    }
+    for p in [pq, ar, cs] {
+        try! fs::remove_file(p);
+    }
+}
+
+#[test]
+fn plans() {
+    let q = data().lazy().with_column("z", col("x") .* 2).filter(col("y") .> 0 .&& col("z") .> 3.0).select(["z"]);
+    let p = try! q.explain();
+    // The filter on `y` moves below the new column; the one on `z`
+    // stays above it; only `x` and `y` are read.
+    assert(p == "SELECT [z]\n  FILTER (col(\"z\") .> 3)\n    WITH [z = (col(\"x\") .* 2)]\n      FILTER (col(\"y\") .> 0)\n        SELECT [x, y]\n          TABLE 200 rows [id, g, x, y]", p);
+    let w = data().lazy().with_column("r", col("y").cum_sum()).filter(col("y") .> 0);
+    assert((try! w.explain()).starts_with("FILTER"), try! w.explain());
+}
+
+#[test]
+fn parquet_scan_skips_row_groups() {
+    let n = 100usize;
+    let t = try! Table::from_columns([("k", Column::from(List::from_fn(n, |i| i as i64))), ("v", Column::from(List::from_fn(n, |i| f"row {i}")))]);
+    let b = Parquet::new().row_group_rows(25).compression(pkg::Compression::None).write_bytes(t);
+    // Spoil the first row group's pages (its metadata, in the footer,
+    // stays good): reading it fails, so a scan that succeeds skipped it.
+    for k in 10..60 {
+        b[k] = 0xEEu8;
+    }
+    let p = tmp("skip.parquet");
+    try! fs::write(p, b);
+    assert((try? pkg::read_parquet(p)) is none);
+    let q = pkg::scan_parquet(p).filter(col("k") .>= 30 .&& col("k") .< 40);
+    let got = try q.collect() catch e { panic(f"{e}"); };
+    assert(got.nrows() == 10 && got.row(0).i64("k") == 30);
+    assert((try! q.explain()).contains("row groups by [k >= 30, k < 40]"), try! q.explain());
+    let q2 = pkg::scan_parquet(p).filter(5 .< col("k") .&& col("k") .< 20);
+    assert((try? q2.collect()) is none);
+    try! fs::remove_file(p);
+}
+
+#[test]
+fn limits_stop_scans() {
+    let t = data();
+    let cs = tmp("lim.csv");
+    try! Csv::new().write_file(t, cs);
+    let q = Csv::new().batch_rows(10).scan(cs).limit(15).select(["id"]);
+    let p = try! q.explain();
+    assert(p.contains("limit 15") && p.contains("read [id]"), p);
+    assert(try! q.collect() == try! t.head(15).select(["id"]));
+    try! fs::remove_file(cs);
+}

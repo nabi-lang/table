@@ -1,0 +1,47 @@
+//! Column-oriented tables. A `Table` is named, ordered `Column`s of one
+//! length; each column is one typed `List` (i64, f64, bool, str,
+//! dictionary-encoded str, date, datetime) plus a validity bitmap for
+//! nulls. Operations run a column at a time; grouping and joins hash
+//! rows into integer keys first (`keys`), so no per-row allocation.
+
+pub mod arrow;
+pub mod build;
+pub mod column;
+pub mod csv;
+pub mod date;
+pub mod display;
+pub mod error;
+pub mod expr;
+pub mod frame;
+pub mod group;
+pub mod join;
+pub mod jsonl;
+pub mod lazy;
+pub mod ops;
+pub mod parquet;
+pub mod reshape;
+pub mod schema;
+pub mod sort;
+pub mod stats;
+pub mod value;
+
+mod bytes;
+mod codec;
+mod keys;
+
+pub use arrow::{Arrow, arrow_schema, read_arrow, write_arrow};
+pub use build::{Record, ToValue, record_table};
+pub use column::Column;
+pub use csv::{Csv, CsvReader, read_csv, read_csv_str, write_csv};
+pub use date::{Date, DateTime};
+pub use error::TableError;
+pub use expr::{Expr, IntoExpr, Then, When, col, lit, when};
+pub use frame::{Row, Table};
+pub use group::{Agg, AggKind, GroupBy, count, count_of, custom, first, last, max, mean, median, min, n_unique, quantile, std, sum, var};
+pub use join::How;
+pub use jsonl::{read_jsonl, read_jsonl_str, write_jsonl, write_jsonl_str};
+pub use lazy::{LazyGroupBy, Query, scan_arrow, scan_csv, scan_parquet};
+pub use parquet::{Compression, Parquet, parquet_schema, read_parquet, write_parquet};
+pub use schema::{DType, Field, Schema};
+pub use sort::{SortKey, asc, desc};
+pub use value::Value;

@@ -1,0 +1,191 @@
+//! Lazy queries: a `Query` records the operations of a table pipeline
+//! as a plan and runs it only on `collect`, after an optimizer has
+//! moved filters as early as they can go (into a file scan, where
+//! Parquet row groups whose statistics rule a filter out are not read)
+//! and pruned every column nothing downstream uses (a scan reads only
+//! those). `explain` prints the plan it will run.
+//!
+//! ```nabi
+//! use table::{col, desc, sum};
+//! let t = table::table!{
+//!     "city": ["Seoul", "Busan", "Seoul", "Daegu"],
+//!     "temp": [21.5, 24.0, 19.0, 30.5],
+//!     "rain": [0.0, 12.5, 3.0, 0.0],
+//! };
+//! let q = t.lazy()
+//!     .with_column("hot", col("temp") .> 20.0)
+//!     .filter(col("rain") .< 5.0)
+//!     .group_by(["city"]).agg([sum("temp")])
+//!     .sort([desc("temp_sum")]);
+//! let out = try q.collect();
+//! assert(out.nrows() == 2 && out.row(0).str("city") == "Seoul");
+//! assert((try q.explain()).contains("FILTER"));
+//! ```
+
+mod plan;
+mod run;
+
+use pkg::lazy::plan::{Plan, Source, Step, optimize, show};
+use pkg::{Agg, Arrow, Csv, Expr, How, Parquet, SortKey, Table, TableError, asc};
+
+/// A table pipeline that runs on `collect`. Build it from
+/// `Table::lazy` or a file scan (`scan_parquet`, `scan_arrow`,
+/// `scan_csv`); each method adds one step and returns a new query.
+///
+/// ```nabi
+/// use table::col;
+/// let q = table::table!{ "x": [1, 2, 3, 4] }.lazy().filter(col("x") .> 2).limit(1);
+/// assert(try q.collect() == table::table!{ "x": [3] });
+/// ```
+#[derive(Clone)]
+pub struct Query {
+    pub(pkg) plan: Plan;
+}
+
+/// A query grouped by key columns, waiting for its aggregations.
+#[derive(Clone)]
+pub struct LazyGroupBy {
+    q: Query;
+    keys: List<str>;
+}
+
+fn step(q: Query, s: Step) -> Query { Query { plan: Plan { step: s, kids: [q.plan] } } }
+
+impl Query {
+    /// Only the columns `names`, in that order.
+    pub fn select(self, names: List<str>) -> Query { step(self, Step::Select(names)) }
+
+    /// The rows where `e` is `true` (null counts as `false`).
+    pub fn filter(self, e: Expr) -> Query { step(self, Step::Filter(e)) }
+
+    /// A computed column, as `Table::with_column`.
+    pub fn with_column(self, name: str, e: Expr) -> Query { step(self, Step::With([(name, e)])) }
+
+    /// Several computed columns, each from the input of this step, as
+    /// `Table::with_columns`.
+    pub fn with_columns(self, es: List<(str, Expr)>) -> Query { step(self, Step::With(es)) }
+
+    /// Group by `keys`; `agg` on the result gives the query back.
+    ///
+    /// ```nabi
+    /// use table::{count, mean};
+    /// let t = table::table!{ "g": ["a", "b", "a"], "x": [1.0, 2.0, 5.0] };
+    /// let out = try t.lazy().group_by(["g"]).agg([count(), mean("x")]).collect();
+    /// assert(out.names() == ["g", "count", "x_mean"]);
+    /// ```
+    pub fn group_by(self, keys: List<str>) -> LazyGroupBy { LazyGroupBy { q: self, keys } }
+
+    /// Sorted by `keys`, as `Table::sort`.
+    pub fn sort(self, keys: List<SortKey>) -> Query { step(self, Step::Sort(keys)) }
+
+    /// Sorted ascending by the columns `names`.
+    pub fn sort_by(self, names: List<str>) -> Query { step(self, Step::Sort(names.iter().map(|n| asc(n)).collect())) }
+
+    /// Joined with `o` on the shared key columns `on`, as `Table::join`.
+    ///
+    /// ```nabi
+    /// let people = table::table!{ "id": [1, 2], "name": ["ann", "bob"] };
+    /// let orders = table::table!{ "id": [1, 1, 2], "amount": [5.0, 7.0, 2.0] };
+    /// let q = people.lazy().join(orders.lazy(), ["id"], table::How::Inner);
+    /// assert((try q.collect()).nrows() == 3);
+    /// ```
+    pub fn join(self, o: Query, on: List<str>, how: How) -> Query { self.join_on(o, on, on, how) }
+
+    /// Joined with `o` on key pairs, as `Table::join_on`.
+    pub fn join_on(self, o: Query, left_on: List<str>, right_on: List<str>, how: How) -> Query {
+        Query { plan: Plan { step: Step::Join(left_on, right_on, how), kids: [self.plan, o.plan] } }
+    }
+
+    /// The first `n` rows.
+    pub fn limit(self, n: usize) -> Query { step(self, Step::Limit(n)) }
+
+    /// The first `n` rows (`limit`).
+    pub fn head(self, n: usize) -> Query { self.limit(n) }
+
+    /// Optimize the plan and run it.
+    pub fn collect(self) throws (TableError) -> Table { try run::exec(try optimize(self.plan)) }
+
+    /// Run the plan as written, without optimizing: the reference
+    /// `collect` must agree with.
+    pub fn collect_unoptimized(self) throws (TableError) -> Table { try run::exec(self.plan) }
+
+    /// The optimized plan, one step per line, the source last.
+    ///
+    /// ```nabi
+    /// use table::col;
+    /// let q = table::table!{ "a": [1, 2], "b": [3, 4] }.lazy().filter(col("a") .> 1).select(["b"]);
+    /// let p = try q.explain();
+    /// assert(p.starts_with("SELECT [b]"));
+    /// ```
+    pub fn explain(self) throws (TableError) -> str { show(try optimize(self.plan)) }
+
+    /// The plan as written.
+    pub fn explain_unoptimized(self) -> str { show(self.plan) }
+}
+
+impl LazyGroupBy {
+    /// One row per group: the keys, then each aggregation.
+    pub fn agg(self, aggs: List<Agg>) -> Query { step(self.q, Step::Agg(self.keys, aggs)) }
+}
+
+impl Table {
+    /// This table as the source of a lazy query.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [3, 1, 2] };
+    /// assert(try t.lazy().sort_by(["x"]).collect() == table::table!{ "x": [1, 2, 3] });
+    /// ```
+    pub fn lazy(self) -> Query { Query { plan: Plan { step: Step::Frame(self), kids: List::new() } } }
+}
+
+fn scan(s: Source) -> Query { Query { plan: Plan { step: Step::Scan(s), kids: List::new() } } }
+
+impl Parquet {
+    /// A lazy scan of the Parquet file at `path` with these options:
+    /// only the columns the query uses are read, and row groups whose
+    /// statistics rule out a pushed filter are skipped.
+    ///
+    /// ```nabi norun
+    /// let q = table::Parquet::new().scan("trips.parquet").filter(table::col("fare") .> 50.0);
+    /// ```
+    pub fn scan(self, path: str) -> Query { scan(Source::parquet(path, self)) }
+}
+
+impl Arrow {
+    /// A lazy scan of the Arrow file at `path`: only the columns the
+    /// query uses are decoded.
+    pub fn scan(self, path: str) -> Query { scan(Source::arrow(path, self)) }
+}
+
+impl Csv {
+    /// A lazy scan of the CSV file at `path`, read in batches of
+    /// `batch_rows`: each batch is filtered and pruned before the next,
+    /// and reading stops once a limit is met. Column types come from the
+    /// first `infer_rows` rows (as `reader`), not the whole file.
+    pub fn scan(self, path: str) -> Query { scan(Source::csv(path, self)) }
+}
+
+/// `Parquet::new().scan(path)`.
+///
+/// ```nabi norun
+/// let top = try table::scan_parquet("trips.parquet")
+///     .filter(table::col("fare") .> 50.0)
+///     .select(["fare", "tip"])
+///     .limit(10)
+///     .collect();
+/// ```
+pub fn scan_parquet(path: str) -> Query { Parquet::new().scan(path) }
+
+/// `Arrow::new().scan(path)`.
+///
+/// ```nabi norun
+/// let q = table::scan_arrow("trips.arrow").select(["fare"]);
+/// ```
+pub fn scan_arrow(path: str) -> Query { Arrow::new().scan(path) }
+
+/// `Csv::new().scan(path)`.
+///
+/// ```nabi norun
+/// let q = table::scan_csv("trips.csv").filter(table::col("fare") .> 50.0);
+/// ```
+pub fn scan_csv(path: str) -> Query { Csv::new().scan(path) }

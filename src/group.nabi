@@ -1,0 +1,515 @@
+//! Group-by and aggregation. Rows get a group id from a hash of their key
+//! codes (`keys`); every aggregation is then one pass over its column,
+//! indexing per-group accumulators by group id. Groups keep the order of
+//! their first row. Above `PAR_ROWS` rows the grouping is partitioned by
+//! hash and the partitions are grouped on several workers.
+
+use pkg::column::bitmap::Bitmap;
+use pkg::column::{Builder, Data};
+use pkg::keys;
+use pkg::keys::{Codes, Dictionary, Index};
+use pkg::sort::fkey;
+use pkg::{Column, DType, Table, TableError, Value};
+use core::par;
+
+/// Rows above which grouping is partitioned across workers.
+pub(pkg) const PAR_ROWS: usize = 1000000;
+
+/// What an aggregation computes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AggKind {
+    /// Rows in the group (with a column: its non-null values).
+    Count,
+    Sum,
+    Mean,
+    Min,
+    Max,
+    /// Sample standard deviation (n - 1).
+    Std,
+    /// Sample variance (n - 1).
+    Var,
+    Median,
+    /// The `q` quantile, linear between closest ranks (NumPy's default).
+    Quantile,
+    /// The first non-null value.
+    First,
+    /// The last non-null value.
+    Last,
+    /// Distinct non-null values.
+    NUnique,
+    /// A closure over the group's column.
+    Custom,
+}
+
+/// One aggregation: a kind, its input column and the output name
+/// (`<column>_<kind>` unless `named`).
+///
+/// ```nabi
+/// use table::{count, mean, sum};
+/// let t = table::table!{ "g": ["a", "b", "a"], "x": [1.0, 2.0, 5.0] };
+/// let s = try (try t.group_by(["g"])).agg([count(), sum("x"), mean("x").named("avg")]) catch _ { t };
+/// assert(s.names() == ["g", "count", "x_sum", "avg"]);
+/// assert(s.row(0).f64("avg") == 3.0);
+/// ```
+pub struct Agg {
+    pub(pkg) kind: AggKind;
+    pub(pkg) column: str;
+    pub(pkg) name: str;
+    pub(pkg) q: f64;
+    pub(pkg) f: fn(Column) -> Value;
+}
+
+impl Clone for Agg {
+    fn clone(self) -> Agg { Agg { kind: self.kind, column: self.column, name: self.name, q: self.q, f: self.f } }
+}
+
+fn agg(kind: AggKind, column: str, suffix: str) -> Agg {
+    Agg { kind, column, name: f"{column}_{suffix}", q: 0.5, f: |_| Value::Null }
+}
+
+/// Rows per group, named `count`.
+pub fn count() -> Agg { Agg { kind: AggKind::Count, column: "", name: "count", q: 0.0, f: |_| Value::Null } }
+/// Non-null values of `c` per group.
+pub fn count_of(c: str) -> Agg { agg(AggKind::Count, c, "count") }
+/// Sum (`i64` stays `i64`; `f64` with Neumaier compensation).
+pub fn sum(c: str) -> Agg { agg(AggKind::Sum, c, "sum") }
+/// Arithmetic mean, compensated sum over the count.
+pub fn mean(c: str) -> Agg { agg(AggKind::Mean, c, "mean") }
+/// Smallest value, any orderable type.
+pub fn min(c: str) -> Agg { agg(AggKind::Min, c, "min") }
+/// Largest value, any orderable type.
+pub fn max(c: str) -> Agg { agg(AggKind::Max, c, "max") }
+/// Sample standard deviation, Welford's one-pass update.
+pub fn std(c: str) -> Agg { agg(AggKind::Std, c, "std") }
+/// Sample variance (n - 1), Welford.
+pub fn var(c: str) -> Agg { agg(AggKind::Var, c, "var") }
+/// The 0.5 quantile, linear interpolation.
+pub fn median(c: str) -> Agg { agg(AggKind::Median, c, "median") }
+/// The `q` quantile (`0 <= q <= 1`), linear interpolation.
+pub fn quantile(c: str, q: f64) -> Agg { Agg { kind: AggKind::Quantile, column: c, name: f"{c}_q{q}", q, f: |_| Value::Null } }
+/// The first non-null value.
+pub fn first(c: str) -> Agg { agg(AggKind::First, c, "first") }
+/// The last non-null value.
+pub fn last(c: str) -> Agg { agg(AggKind::Last, c, "last") }
+/// How many distinct non-null values.
+pub fn n_unique(c: str) -> Agg { agg(AggKind::NUnique, c, "n_unique") }
+
+/// `f` of each group's slice of column `c`, named `name`.
+///
+/// ```nabi
+/// use table::{custom, Value};
+/// let t = table::table!{ "g": [1, 1, 2], "x": [3.0, 1.0, 7.0] };
+/// let range = custom("x", "range", |c| {
+///     let xs = try c.f64_list() catch _ { [0.0] };
+///     Value::Float(xs.iter().fold(f64::NEG_INFINITY, |a, b| a.max(b)) - xs.iter().fold(f64::INFINITY, |a, b| a.min(b)))
+/// });
+/// let s = try (try t.group_by(["g"])).agg([range]) catch _ { t };
+/// assert(s.row(0).f64("range") == 2.0);
+/// ```
+pub fn custom(c: str, name: str, f: fn(Column) -> Value) -> Agg { Agg { kind: AggKind::Custom, column: c, name, q: 0.0, f } }
+
+impl Agg {
+    /// The same aggregation with output column `name`.
+    pub fn named(self, name: str) -> Agg { Agg { kind: self.kind, column: self.column, name, q: self.q, f: self.f } }
+}
+
+/// A table split into groups by key columns, ready to aggregate.
+pub struct GroupBy {
+    pub(pkg) t: Table;
+    pub(pkg) keys: List<usize>;
+    /// Group of each row.
+    pub(pkg) gid: List<u32>;
+    /// First row of each group, groups in order of first appearance.
+    pub(pkg) first: List<usize>;
+}
+
+/// Grouping of `c` without workers: one table, rows in order.
+fn group_seq(c: Codes) -> (List<u32>, List<usize>) {
+    let (gid, ix) = keys::group(c);
+    (gid, ix.first)
+}
+
+/// Grouping with workers: the rows are cut into contiguous chunks
+/// (slices of the code lists, so the workers share nothing), each chunk
+/// is grouped alone, then the chunk groups are merged in chunk order.
+/// Chunks are in row order and each keeps first-appearance order, so the
+/// ids equal `group_seq`'s.
+fn group_par(c: Codes) -> (List<u32>, List<usize>) {
+    let n = c.n;
+    let chunks = (task::cpu_count() * 2).max(1).min(n);
+    let size = (n + chunks - 1) / chunks;
+    let items: List<(usize, List<Slice<i64>>)> = List::new();
+    let start: usize = 0;
+    while start < n {
+        let end = (start + size).min(n);
+        items.push((start, c.cols.iter().map(|col| col[start:end]).collect()));
+        start = end;
+    }
+    let local: List<(List<u32>, List<usize>)> = par::map(items, |it| {
+        let cols: List<List<i64>> = it.1.iter().map(|s| s.to_list()).collect();
+        let m = if cols.is_empty() { 0 } else { cols[0].len() };
+        let (g, ix) = keys::group(Codes { cols, null: none, n: m });
+        (g, ix.first)
+    });
+    // Merge: each chunk group's first row, looked up in one index of the
+    // groups seen so far.
+    let gid: List<u32> = List::filled(n, 0u32);
+    let first: List<usize> = List::new();
+    let reps: List<List<i64>> = List::from_fn(c.cols.len(), |_| List::new());
+    let base: usize = 0;
+    let merged = Index::new(1024);
+    for k in 0..local.len() {
+        let (lg, lfirst) = local[k];
+        // Representatives of this chunk's groups, appended to `reps`.
+        let off = reps[0].len();
+        for g in lfirst {
+            let row = base + g;
+            for j in 0..c.cols.len() { reps[j].push(c.cols[j][row]); }
+        }
+        let all = Codes { cols: reps, null: none, n: reps[0].len() };
+        let map: List<u32> = List::with_capacity(lfirst.len());
+        let hs = keys::hashes(Codes { cols: reps.iter().map(|r| r[off:].to_list()).collect(), null: none, n: lfirst.len() });
+        for g in 0..lfirst.len() {
+            let found = merged.find(hs[g], all, all, off + g);
+            if found >= 0 {
+                map.push(found as u32);
+            } else {
+                let id = first.len();
+                merged.add(hs[g], off + g);
+                first.push(base + lfirst[g]);
+                map.push(id as u32);
+            }
+        }
+        for j in 0..lg.len() { gid[base + j] = map[lg[j] as usize]; }
+        base += lg.len();
+    }
+    (gid, first)
+}
+
+impl Table {
+    /// Group by the columns `names` (null is a key value of its own).
+    /// Groups come out in the order of their first row.
+    pub fn group_by(self, names: List<str>) throws (TableError) -> GroupBy {
+        if names.is_empty() {
+            throw TableError::invalid("group_by needs at least one key column; for whole-table totals use `t.agg([..])`");
+        }
+        let ks = try keys::positions(self, names);
+        let c = keys::codes(self, ks, Dictionary::new(), List::filled(ks.len(), false), true);
+        let (gid, first) = if self.rows >= PAR_ROWS { group_par(c) } else { group_seq(c) };
+        GroupBy { t: self, keys: ks, gid, first }
+    }
+
+    /// Aggregations over the whole table, one row.
+    ///
+    /// ```nabi
+    /// use table::{max, sum};
+    /// let t = table::table!{ "x": [1, 2, 3] };
+    /// let s = try t.agg([sum("x"), max("x")]) catch _ { t };
+    /// assert(s.row(0).i64("x_sum") == 6 && s.row(0).i64("x_max") == 3);
+    /// ```
+    pub fn agg(self, aggs: List<Agg>) throws (TableError) -> Table {
+        let g = GroupBy { t: self, keys: List::new(), gid: List::filled(self.rows, 0u32), first: [0] };
+        try g.agg(aggs)
+    }
+}
+
+impl GroupBy {
+    /// The number of groups.
+    pub fn len(self) -> usize { self.first.len() }
+
+    /// Group id of each row (`0..len()`).
+    pub fn group_ids(self) -> List<u32> { self.gid }
+
+    /// One row per group: the key columns, then one column per
+    /// aggregation in order.
+    pub fn agg(self, aggs: List<Agg>) throws (TableError) -> Table {
+        let out = Table::new();
+        let ng = self.first.len();
+        if self.t.rows == 0 && self.keys.is_empty() {
+            // Whole-table totals of an empty table: still one row.
+        } else if self.t.rows == 0 {
+            ng = 0;
+        }
+        let firsts = if ng == 0 { List::new() } else { self.first };
+        for k in self.keys {
+            out = try out.set_column(self.t.names[k], self.t.cols[k].take(firsts), false);
+        }
+        for a in aggs {
+            let c = try self.run(a, ng);
+            out = try out.set_column(a.name, c, false);
+        }
+        out
+    }
+
+    /// The groups' sizes.
+    pub fn counts(self) -> List<i64> {
+        let cnt: List<i64> = List::filled(self.first.len(), 0);
+        for g in self.gid { cnt[g as usize] += 1; }
+        cnt
+    }
+
+    fn run(self, a: Agg, ng: usize) throws (TableError) -> Column {
+        if a.kind == AggKind::Count && a.column == "" {
+            return Column::of(Data::I64(if ng == 0 { List::new() } else { self.counts() }));
+        }
+        let c = try self.t.column(a.column);
+        let gid = self.gid;
+        let n = self.t.rows;
+        let dt = c.dtype();
+        let need_num = a.kind == AggKind::Sum || a.kind == AggKind::Mean || a.kind == AggKind::Std
+            || a.kind == AggKind::Var || a.kind == AggKind::Median || a.kind == AggKind::Quantile;
+        if need_num && !dt.is_numeric() && dt != DType::Bool {
+            throw TableError::mismatch(a.column, "a number", dt.name());
+        }
+        match a.kind {
+            AggKind::Count => {
+                let cnt: List<i64> = List::filled(ng, 0);
+                for i in 0..n {
+                    if c.is_valid(i) { cnt[gid[i] as usize] += 1; }
+                }
+                Column::of(Data::I64(cnt))
+            },
+            AggKind::Sum => {
+                if let Data::I64(x) = c.data {
+                    let s: List<i64> = List::filled(ng, 0);
+                    if c.valid is none {
+                        for i in 0..n { s[gid[i] as usize] = s[gid[i] as usize].wrapping_add(x[i]); }
+                    } else {
+                        for i in 0..n {
+                            if c.is_valid(i) { s[gid[i] as usize] = s[gid[i] as usize].wrapping_add(x[i]); }
+                        }
+                    }
+                    return Column::of(Data::I64(s));
+                }
+                let (s, _) = self.sums(c, ng);
+                Column::of(Data::F64(s))
+            },
+            AggKind::Mean => {
+                let (s, cnt) = self.sums(c, ng);
+                let flags: List<bool> = List::from_fn(ng, |g| cnt[g] > 0);
+                let m: List<f64> = List::from_fn(ng, |g| if cnt[g] > 0 { s[g] / cnt[g] as f64 } else { 0.0 });
+                Column::with_valid(Data::F64(m), Bitmap::from_flags(flags))
+            },
+            AggKind::Std => self.spread(c, ng, true),
+            AggKind::Var => self.spread(c, ng, false),
+            AggKind::Min => try self.extreme(c, ng, false),
+            AggKind::Max => try self.extreme(c, ng, true),
+            AggKind::First => self.edge(c, ng, false),
+            AggKind::Last => self.edge(c, ng, true),
+            AggKind::Median => try self.quantiles(c, ng, 0.5),
+            AggKind::Quantile => {
+                if !(a.q >= 0.0 && a.q <= 1.0) {
+                    throw TableError::invalid(f"quantile {a.q} is outside 0..=1; pass a fraction such as 0.25");
+                }
+                try self.quantiles(c, ng, a.q)
+            },
+            AggKind::NUnique => {
+                let cc = Codes { cols: [List::from_fn(n, |i| gid[i] as i64), keys::code_column(c, Dictionary::new(), false)], null: none, n };
+                let (_, ix) = keys::group(cc);
+                let u: List<i64> = List::filled(ng, 0);
+                for r in ix.first {
+                    if c.is_valid(r) { u[gid[r] as usize] += 1; }
+                }
+                Column::of(Data::I64(u))
+            },
+            AggKind::Custom => {
+                let (off, rows) = self.members(ng);
+                let f = a.f;
+                let vs: List<Value> = List::with_capacity(ng);
+                for g in 0..ng { vs.push(f(c.take(rows[off[g]:off[g + 1]].to_list()))); }
+                try Column::from_values(vs, none)
+            },
+        }
+    }
+
+    /// Rows of each group, contiguous: group `g` is `rows[off[g]..off[g + 1]]`,
+    /// ascending (a counting sort by group id).
+    pub(pkg) fn members(self, ng: usize) -> (List<usize>, List<usize>) {
+        let off: List<usize> = List::filled(ng + 1, 0);
+        for g in self.gid { off[g as usize + 1] += 1; }
+        for g in 0..ng { off[g + 1] += off[g]; }
+        let pos = off.clone();
+        let rows: List<usize> = List::filled(self.gid.len(), 0);
+        for i in 0..self.gid.len() {
+            let g = self.gid[i] as usize;
+            rows[pos[g]] = i;
+            pos[g] += 1;
+        }
+        (off, rows)
+    }
+
+    /// Neumaier-compensated sums and non-null counts per group.
+    fn sums(self, c: Column, ng: usize) -> (List<f64>, List<i64>) {
+        let x = try c.f64_list() catch _ { List::filled(c.len(), 0.0) };
+        if x.len() >= PAR_ROWS && c.valid is none {
+            return par_sums(self.gid, x, ng);
+        }
+        let s: List<f64> = List::filled(ng, 0.0);
+        let comp: List<f64> = List::filled(ng, 0.0);
+        let cnt: List<i64> = List::filled(ng, 0);
+        let gid = self.gid;
+        let all = c.valid is none;
+        for i in 0..x.len() {
+            if all || c.is_valid(i) {
+                let g = gid[i] as usize;
+                let v = x[i];
+                let a = s[g];
+                let t = a + v;
+                comp[g] += if a.abs() >= v.abs() { (a - t) + v } else { (v - t) + a };
+                s[g] = t;
+                cnt[g] += 1;
+            }
+        }
+        for g in 0..ng { s[g] += comp[g]; }
+        (s, cnt)
+    }
+
+    /// Welford variance (or its square root) per group; null for fewer
+    /// than two values.
+    fn spread(self, c: Column, ng: usize, root: bool) -> Column {
+        let x = try c.f64_list() catch _ { List::filled(c.len(), 0.0) };
+        let cnt: List<f64> = List::filled(ng, 0.0);
+        let mean: List<f64> = List::filled(ng, 0.0);
+        let m2: List<f64> = List::filled(ng, 0.0);
+        for i in 0..x.len() {
+            if c.is_valid(i) {
+                let g = self.gid[i] as usize;
+                cnt[g] += 1.0;
+                let d = x[i] - mean[g];
+                mean[g] += d / cnt[g];
+                m2[g] += d * (x[i] - mean[g]);
+            }
+        }
+        let out: List<f64> = List::from_fn(ng, |g| {
+            let v = if cnt[g] > 1.0 { m2[g] / (cnt[g] - 1.0) } else { 0.0 };
+            if root { v.sqrt() } else { v }
+        });
+        Column::with_valid(Data::F64(out), Bitmap::from_flags(List::from_fn(ng, |g| cnt[g] > 1.0)))
+    }
+
+    /// The smallest (`max` false) or largest value per group; NaN loses
+    /// to every number.
+    fn extreme(self, c: Column, ng: usize, max: bool) throws (TableError) -> Column {
+        let best: List<i64> = List::filled(ng, -1);
+        let n = c.len();
+        let keyb = pkg::sort::key_bits(c);
+        let nan = match c.data {
+            Data::F64(_) => fkey(f64::NAN),
+            _ => 0u64,
+        };
+        for i in 0..n {
+            if c.is_null(i) { continue; }
+            let g = self.gid[i] as usize;
+            let b = best[g];
+            if b < 0 {
+                best[g] = i as i64;
+                continue;
+            }
+            let ki = keyb[i];
+            let kb = keyb[b as usize];
+            let better = if nan != 0u64 && kb == nan { ki != nan } else if nan != 0u64 && ki == nan { false } else if max { ki > kb } else { ki < kb };
+            if better { best[g] = i as i64; }
+        }
+        c.take_or_null(best)
+    }
+
+    /// The first (or last) non-null value per group.
+    fn edge(self, c: Column, ng: usize, last: bool) -> Column {
+        let pick: List<i64> = List::filled(ng, -1);
+        for i in 0..c.len() {
+            if c.is_null(i) { continue; }
+            let g = self.gid[i] as usize;
+            if last || pick[g] < 0 { pick[g] = i as i64; }
+        }
+        c.take_or_null(pick)
+    }
+
+    /// The `q` quantile per group: each group's values sorted, then
+    /// linear interpolation between closest ranks.
+    fn quantiles(self, c: Column, ng: usize, q: f64) throws (TableError) -> Column {
+        let x = try c.f64_list();
+        let (off, rows) = self.members(ng);
+        let out: List<f64> = List::filled(ng, 0.0);
+        let ok: List<bool> = List::filled(ng, false);
+        let buf: List<f64> = List::new();
+        for g in 0..ng {
+            buf.clear();
+            for j in off[g]..off[g + 1] {
+                let r = rows[j];
+                if c.is_valid(r) { buf.push(x[r]); }
+            }
+            if buf.is_empty() { continue; }
+            buf.sort_by(|a, b| a.total_cmp(b));
+            out[g] = interpolate(buf, q);
+            ok[g] = true;
+        }
+        Column::with_valid(Data::F64(out), Bitmap::from_flags(ok))
+    }
+}
+
+/// Per-group compensated sums and counts of `x` (no nulls), chunks of
+/// rows on several workers, the partial sums then added in chunk order
+/// (so the result does not depend on scheduling).
+fn par_sums(gid: List<u32>, x: List<f64>, ng: usize) -> (List<f64>, List<i64>) {
+    let n = x.len();
+    let chunks = (task::cpu_count() * 2).max(1).min(n);
+    let size = (n + chunks - 1) / chunks;
+    let items: List<(Slice<u32>, Slice<f64>, usize)> = List::new();
+    let start: usize = 0;
+    while start < n {
+        let end = (start + size).min(n);
+        items.push((gid[start:end], x[start:end], ng));
+        start = end;
+    }
+    let parts: List<(List<f64>, List<f64>, List<i64>)> = par::map(items, |it| {
+        let g = it.0;
+        let v = it.1;
+        let m = it.2;
+        let s: List<f64> = List::filled(m, 0.0);
+        let comp: List<f64> = List::filled(m, 0.0);
+        let cnt: List<i64> = List::filled(m, 0);
+        for i in 0..v.len() {
+            let k = g[i] as usize;
+            let a = s[k];
+            let y = v[i];
+            let t = a + y;
+            comp[k] += if a.abs() >= y.abs() { (a - t) + y } else { (y - t) + a };
+            s[k] = t;
+            cnt[k] += 1;
+        }
+        (s, comp, cnt)
+    });
+    let s: List<f64> = List::filled(ng, 0.0);
+    let comp: List<f64> = List::filled(ng, 0.0);
+    let cnt: List<i64> = List::filled(ng, 0);
+    for p in parts {
+        let (ps, pc, pn) = p;
+        for k in 0..ng {
+            let a = s[k];
+            let y = ps[k];
+            let t = a + y;
+            comp[k] += pc[k] + if a.abs() >= y.abs() { (a - t) + y } else { (y - t) + a };
+            s[k] = t;
+            cnt[k] += pn[k];
+        }
+    }
+    for k in 0..ng { s[k] += comp[k]; }
+    (s, cnt)
+}
+
+/// The `q` quantile of sorted `xs` (NumPy `linear`): position
+/// `q * (n - 1)`, interpolated between its neighbours.
+pub(pkg) fn interpolate(xs: List<f64>, q: f64) -> f64 {
+    let pos = q * (xs.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(xs.len() - 1);
+    let frac = pos - lo as f64;
+    if frac == 0.0 { xs[lo] } else { xs[lo] + (xs[hi] - xs[lo]) * frac }
+}
+
+/// A builder-backed column from cells (used by reshaping).
+pub(pkg) fn from_cells(vs: List<Value>, t: DType) throws (TableError) -> Column {
+    let b = Builder::new(t, vs.len());
+    for v in vs { try b.push(v); }
+    try b.finish()
+}

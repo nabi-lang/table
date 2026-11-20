@@ -1,0 +1,27 @@
+// Inner and left hash joins of two 1e6-row tables on an integer key.
+
+use pkg::{Column, How, Table};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn side(n: usize, seed: u64, name: str) -> Table {
+    let rng = Xoshiro256PlusPlus::seed(seed);
+    let k: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(n as u64) as i64);
+    let v: List<f64> = List::from_fn(n, [ref rng] |_| rng.f64());
+    try Table::from_columns([("k", Column::from(k)), (name, Column::from(v))]) catch e { panic(f"{e}"); }
+}
+
+#[bench]
+fn inner_1e6_x_1e6(b: Bench) {
+    let l = side(1000000, 1u64, "a");
+    let r = side(1000000, 2u64, "b");
+    b.iter(|| try black_box(l).join(r, ["k"], How::Inner) catch e { panic(f"{e}"); });
+}
+
+#[bench]
+fn left_1e6_x_1e6(b: Bench) {
+    let l = side(1000000, 1u64, "a");
+    let r = side(1000000, 2u64, "b");
+    b.iter(|| try black_box(l).join(r, ["k"], How::Left) catch e { panic(f"{e}"); });
+}

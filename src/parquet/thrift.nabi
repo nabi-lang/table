@@ -1,0 +1,279 @@
+// The Thrift compact protocol Parquet's metadata is written in: a value
+// tree, read with a depth limit and every length checked, and written
+// back the same way.
+
+use pkg::TableError;
+use pkg::bytes::{bad, f64_at, need, put_u64};
+
+const FMT: str = "parquet";
+
+/// A Thrift value. A list keeps its element type; a map is read as a
+/// list of alternating keys and values.
+pub(pkg) enum Tv {
+    B(bool),
+    I8(i64),
+    I16(i64),
+    I32(i64),
+    I64(i64),
+    D(f64),
+    Bin(List<u8>),
+    L(u64, List<Tv>),
+    S(List<Tf>),
+}
+
+/// Field `id` of a struct.
+pub(pkg) struct Tf {
+    pub(pkg) id: i64;
+    pub(pkg) v: Tv;
+}
+
+pub(pkg) fn f(id: i64, v: Tv) -> Tf { Tf { id, v } }
+
+fn fail(msg: str) -> TableError { bad(FMT, msg) }
+
+/// A read position.
+pub(pkg) struct Cur {
+    pub(pkg) b: List<u8>;
+    pub(pkg) p: usize;
+    pub(pkg) e: usize;
+}
+
+fn byte(ref c: Cur) throws (TableError) -> u64 {
+    if c.p >= c.e { throw fail("the metadata ends early; the file is cut short or not Parquet"); }
+    let x = c.b[c.p] as u64;
+    c.p += 1;
+    x
+}
+
+pub(pkg) fn varint(ref c: Cur) throws (TableError) -> u64 {
+    let v = 0u64;
+    let s = 0u64;
+    loop {
+        let x = try byte(ref c);
+        if s > 63u64 { throw fail("a varint is too long"); }
+        v = v | ((x & 127u64) << s);
+        if x < 128u64 { return v; }
+        s += 7u64;
+    }
+}
+
+fn zigzag(v: u64) -> i64 { ((v >> 1u64) as i64) ^ -((v & 1u64) as i64) }
+
+fn value(ref c: Cur, t: u64, depth: usize) throws (TableError) -> Tv {
+    if depth > 64 { throw fail("the metadata nests too deeply"); }
+    match t {
+        1 => Tv::B(true),
+        2 => Tv::B(false),
+        3 => {
+            let x = try byte(ref c) as i64;
+            Tv::I8(if x >= 128 { x - 256 } else { x })
+        },
+        4 => Tv::I16(zigzag(try varint(ref c))),
+        5 => Tv::I32(zigzag(try varint(ref c))),
+        6 => Tv::I64(zigzag(try varint(ref c))),
+        7 => {
+            try need(c.b, c.p, 8, FMT);
+            if c.p + 8 > c.e { throw fail("a double is cut short"); }
+            let d = f64_at(c.b, c.p);
+            c.p += 8;
+            Tv::D(d)
+        },
+        8 => {
+            let n = try varint(ref c) as usize;
+            if n > c.e - c.p { throw fail("a string runs past the metadata"); }
+            let out = c.b[c.p:c.p + n].to_list();
+            c.p += n;
+            Tv::Bin(out)
+        },
+        9 | 10 => {
+            let h = try byte(ref c);
+            let n = h >> 4u64;
+            if n == 15u64 { n = try varint(ref c); }
+            let et = h & 15u64;
+            if n as usize > c.e - c.p { throw fail("a list is longer than the metadata"); }
+            let xs: List<Tv> = List::with_capacity(n as usize);
+            for _ in 0..n {
+                // Booleans in a list take one byte each.
+                if et == 1u64 || et == 2u64 {
+                    xs.push(Tv::B(try byte(ref c) == 1u64));
+                } else {
+                    xs.push(try value(ref c, et, depth + 1));
+                }
+            }
+            Tv::L(et, xs)
+        },
+        11 => {
+            let n = try varint(ref c);
+            let xs: List<Tv> = List::new();
+            if n > 0u64 {
+                let kv = try byte(ref c);
+                if n as usize > c.e - c.p { throw fail("a map is longer than the metadata"); }
+                for _ in 0..n {
+                    xs.push(try value(ref c, kv >> 4u64, depth + 1));
+                    xs.push(try value(ref c, kv & 15u64, depth + 1));
+                }
+            }
+            Tv::L(11u64, xs)
+        },
+        12 => Tv::S(try fields(ref c, depth + 1)),
+        _ => throw fail(f"an unknown Thrift type {t}"),
+    }
+}
+
+fn fields(ref c: Cur, depth: usize) throws (TableError) -> List<Tf> {
+    let out: List<Tf> = List::new();
+    let last = 0i64;
+    loop {
+        let h = try byte(ref c);
+        if h == 0u64 { return out; }
+        let d = (h >> 4u64) as i64;
+        let id = if d == 0 { zigzag(try varint(ref c)) } else { last + d };
+        out.push(Tf { id, v: try value(ref c, h & 15u64, depth) });
+        last = id;
+    }
+}
+
+/// The struct at `c`, advancing past it.
+pub(pkg) fn read_struct(ref c: Cur) throws (TableError) -> List<Tf> { try fields(ref c, 0) }
+
+// Accessors: a missing or mistyped field gives `none` or the default.
+
+pub(pkg) fn get(s: List<Tf>, id: i64) -> Tv | none {
+    for x in s {
+        if x.id == id { return x.v; }
+    }
+    none
+}
+
+pub(pkg) fn num(s: List<Tf>, id: i64, default: i64) -> i64 {
+    match get(s, id) {
+        v: Tv => match v {
+            Tv::I8(x) => x,
+            Tv::I16(x) => x,
+            Tv::I32(x) => x,
+            Tv::I64(x) => x,
+            _ => default,
+        },
+        none => default,
+    }
+}
+
+pub(pkg) fn has(s: List<Tf>, id: i64) -> bool { !(get(s, id) is none) }
+
+pub(pkg) fn boolean(s: List<Tf>, id: i64, default: bool) -> bool {
+    match get(s, id) {
+        v: Tv => if let Tv::B(x) = v { x } else { default },
+        none => default,
+    }
+}
+
+pub(pkg) fn bin(s: List<Tf>, id: i64) -> List<u8> | none {
+    match get(s, id) {
+        v: Tv => if let Tv::Bin(x) = v { x } else { none },
+        none => none,
+    }
+}
+
+pub(pkg) fn text(s: List<Tf>, id: i64) -> str {
+    match bin(s, id) {
+        x: List<u8> => str::from_utf8_lossy(x),
+        none => "",
+    }
+}
+
+pub(pkg) fn sub(s: List<Tf>, id: i64) -> List<Tf> | none {
+    match get(s, id) {
+        v: Tv => if let Tv::S(x) = v { x } else { none },
+        none => none,
+    }
+}
+
+pub(pkg) fn list(s: List<Tf>, id: i64) -> List<Tv> {
+    match get(s, id) {
+        v: Tv => if let Tv::L(_, x) = v { x } else { List::new() },
+        none => List::new(),
+    }
+}
+
+pub(pkg) fn as_struct(v: Tv) -> List<Tf> { if let Tv::S(x) = v { x } else { List::new() } }
+
+// Writing.
+
+fn put_varint(b: List<u8>, v: u64) {
+    let x = v;
+    while x >= 128u64 {
+        b.push((x & 127u64 | 128u64) as u8);
+        x = x >> 7u64;
+    }
+    b.push(x as u8);
+}
+
+fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+
+fn code(v: Tv) -> u64 {
+    match v {
+        Tv::B(x) => if x { 1u64 } else { 2u64 },
+        Tv::I8(_) => 3u64,
+        Tv::I16(_) => 4u64,
+        Tv::I32(_) => 5u64,
+        Tv::I64(_) => 6u64,
+        Tv::D(_) => 7u64,
+        Tv::Bin(_) => 8u64,
+        Tv::L(_, _) => 9u64,
+        Tv::S(_) => 12u64,
+    }
+}
+
+fn put_value(b: List<u8>, v: Tv) {
+    match v {
+        Tv::B(_) => {},
+        Tv::I8(x) => b.push(x as u8),
+        Tv::I16(x) => put_varint(b, zz(x)),
+        Tv::I32(x) => put_varint(b, zz(x)),
+        Tv::I64(x) => put_varint(b, zz(x)),
+        Tv::D(x) => put_u64(b, x.to_bits()),
+        Tv::Bin(x) => {
+            put_varint(b, x.len() as u64);
+            for y in x {
+                b.push(y);
+            }
+        },
+        Tv::L(et, xs) => {
+            if xs.len() < 15 {
+                b.push(((xs.len() as u64) << 4u64 | et) as u8);
+            } else {
+                b.push((0xF0u64 | et) as u8);
+                put_varint(b, xs.len() as u64);
+            }
+            for x in xs {
+                if let Tv::B(y) = x { b.push(if y { 1u8 } else { 2u8 }); } else { put_value(b, x); }
+            }
+        },
+        Tv::S(fs) => write_struct(b, fs),
+    }
+}
+
+/// Append struct `fs` (fields in rising id order).
+pub(pkg) fn write_struct(b: List<u8>, fs: List<Tf>) {
+    let last = 0i64;
+    for x in fs {
+        let d = x.id - last;
+        if d > 0 && d <= 15 {
+            b.push(((d as u64) << 4u64 | code(x.v)) as u8);
+        } else {
+            b.push(code(x.v) as u8);
+            put_varint(b, zz(x.id));
+        }
+        put_value(b, x.v);
+        last = x.id;
+    }
+    b.push(0u8);
+}
+
+/// The element type code of a list of `v`s.
+pub(pkg) fn list_of(xs: List<Tv>) -> Tv {
+    let et = if xs.is_empty() { 12u64 } else { code(xs[0]) };
+    Tv::L(if et == 2u64 { 1u64 } else { et }, xs)
+}
+
+pub(pkg) fn bytes_of(s: str) -> Tv { Tv::Bin(s.as_bytes().to_list()) }

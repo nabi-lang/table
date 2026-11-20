@@ -1,0 +1,497 @@
+//! CSV (RFC 4180) through the `csv` package: a header line, any
+//! one-byte delimiter, `"`-quoted fields with `""` for a quote and line
+//! breaks inside, LF / CRLF / CR line ends, a UTF-8 BOM skipped. Columns
+//! are typed by trying, in order, bool, i64, f64, date, datetime and str
+//! on their non-null cells (or as `types` says). `CsvReader` reads an
+//! `io::Read` in chunks and yields tables of up to `batch` rows, so
+//! memory stays flat for large files.
+
+use pkg::column::bitmap::Bitmap;
+use pkg::column::{Data, parse_bool, parse_f64, parse_i64};
+use pkg::{Column, Date, DateTime, DType, Table, TableError, Value};
+use std::fs;
+
+/// How to read or write CSV. Start from `Csv::new()` and change what
+/// differs.
+///
+/// ```nabi
+/// use table::{Csv, DType};
+/// let o = Csv::new().delimiter(';').null("-").types([("id", DType::Str)]);
+/// let t = try o.read_str("id;x\n007;1,5\n008;-\n") catch _ { table::Table::new() };
+/// assert(t.row(0).str("id") == "007");
+/// assert(t.column_at(1).null_count() == 1);
+/// ```
+#[derive(Clone)]
+pub struct Csv {
+    /// The field separator, `,` by default.
+    pub delim: u8;
+    /// The first line names the columns (else `column_1`, ...).
+    pub header: bool;
+    /// Cells read as null; written for a null.
+    pub nulls: List<str>;
+    /// Column types that skip inference.
+    pub types: Dict<str, DType>;
+    /// Rows looked at to pick types when streaming (`CsvReader`).
+    pub infer_rows: usize;
+    /// Rows per `CsvReader::next` table.
+    pub batch: usize;
+    /// Write `\r\n` line ends (RFC 4180); `\n` by default.
+    pub crlf: bool;
+    /// Strip whitespace around unquoted fields.
+    pub trim: bool;
+}
+
+impl Csv {
+    /// Comma-separated, with a header; `""`, `NA`, `N/A`, `null`,
+    /// `NULL` read as null.
+    pub fn new() -> Csv {
+        Csv {
+            delim: 0x2Cu8, header: true, nulls: ["", "NA", "N/A", "null", "NULL"], types: Dict::new(),
+            infer_rows: 10000, batch: 65536, crlf: false, trim: false,
+        }
+    }
+
+    /// Fields separated by `c` (one ASCII character).
+    pub fn delimiter(self, c: char) -> Csv {
+        let o = self;
+        o.delim = c as u32 as u8;
+        o
+    }
+
+    /// Whether the first line names the columns.
+    pub fn has_header(self, yes: bool) -> Csv {
+        let o = self;
+        o.header = yes;
+        o
+    }
+
+    /// Also read `token` as null (and write nulls as it).
+    pub fn null(self, token: str) -> Csv {
+        let o = self;
+        o.nulls = [token];
+        o.nulls.extend(self.nulls);
+        o
+    }
+
+    /// Exactly these tokens are nulls; the first is written for a null.
+    pub fn null_tokens(self, tokens: List<str>) -> Csv {
+        let o = self;
+        o.nulls = tokens;
+        o
+    }
+
+    /// Fix the types of some columns by name.
+    pub fn types(self, ts: List<(str, DType)>) -> Csv {
+        let o = self;
+        o.types = self.types.clone();
+        for (n, t) in ts { _ = o.types.insert(n, t); }
+        o
+    }
+
+    /// Rows per batch of `CsvReader`.
+    pub fn batch_rows(self, n: usize) -> Csv {
+        let o = self;
+        o.batch = n.max(1);
+        o
+    }
+
+    /// Strip blanks around unquoted fields.
+    pub fn trimmed(self, yes: bool) -> Csv {
+        let o = self;
+        o.trim = yes;
+        o
+    }
+
+    /// `\r\n` line ends when writing.
+    pub fn crlf_lines(self, yes: bool) -> Csv {
+        let o = self;
+        o.crlf = yes;
+        o
+    }
+
+    /// The `csv` dialect these options read and write with.
+    ///
+    /// ```nabi
+    /// let d = table::Csv::new().delimiter(';').dialect();
+    /// assert(d.delim == 0x3Bu8 && d.header);
+    /// ```
+    pub fn dialect(self) -> csvio::Dialect {
+        // Rows of another width and blank lines are this module's to
+        // judge: its messages name the header, and a blank line is a cell
+        // when there is one column.
+        csvio::Dialect::new()
+            .delimiter(char::from_u32(self.delim as u32) ?? ',')
+            .has_header(self.header)
+            .trim(if self.trim { csvio::Trim::All } else { csvio::Trim::None })
+            .crlf(self.crlf)
+            .flexible(true)
+            .skip_blank_lines(false)
+    }
+
+    /// A table from CSV text, every row used to pick the types.
+    pub fn read_str(self, s: str) throws (TableError) -> Table {
+        let p = Rows::new(self, self.dialect().from_str(s));
+        let names = try p.header_names();
+        let raw = Raw::new(names.len());
+        _ = try p.records(raw, usize::MAX);
+        try finish(self, names, raw, none, 0)
+    }
+
+    /// A table from the CSV file at `path`.
+    pub fn read_file(self, path: str) throws (TableError) -> Table {
+        let s = try fs::read_to_str(path) catch e { throw TableError::Io { msg: f"cannot read `{path}`: {e}" }; };
+        try self.read_str(s)
+    }
+
+    /// A streaming reader over `r`.
+    pub fn reader<R: Read>(self, r: R) -> CsvReader {
+        CsvReader { opts: self, p: Rows::new(self, self.dialect().reader(r)), names: none, types: none }
+    }
+
+    /// The table as CSV text.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "a": [1, none], "b": ["x,y", "q\""] };
+    /// assert(table::Csv::new().write_str(t) == "a,b\n1,\"x,y\"\n,\"q\"\"\"\n");
+    /// ```
+    pub fn write_str(self, t: Table) -> str {
+        let w = self.dialect().to_buffer();
+        let null = if self.nulls.is_empty() { "" } else { self.nulls[0] };
+        // The memory writer fails only on a field it cannot write, and
+        // these are quoted or plain values.
+        if self.header {
+            for n in t.names { try! w.write_field(n); }
+            try! w.end_record();
+        }
+        for i in 0..t.rows {
+            for k in 0..t.cols.len() {
+                let c = t.cols[k];
+                if c.is_null(i) {
+                    try! w.write_unquoted(null);
+                    continue;
+                }
+                match c.get(i) {
+                    // A string that reads as null is quoted to stay a value.
+                    Value::Str(x) => if self.nulls.contains(x) { try! w.write_quoted(x); } else { try! w.write_field(x); },
+                    // Numbers, booleans and dates hold no delimiter or quote.
+                    v => try! w.write_raw(f"{v}"),
+                }
+            }
+            try! w.end_record();
+        }
+        w.as_str()
+    }
+
+    /// Write the table to the file at `path`.
+    pub fn write_file(self, t: Table, path: str) throws (TableError) {
+        try fs::write(path, self.write_str(t)) catch e { throw TableError::Io { msg: f"cannot write `{path}`: {e}" }; };
+    }
+}
+
+/// Read the CSV file at `path` with the default options.
+///
+/// ```nabi norun
+/// let t = try "data.csv" |> table::read_csv;
+/// ```
+pub fn read_csv(path: str) throws (TableError) -> Table { try Csv::new().read_file(path) }
+
+/// A table from CSV text with the default options.
+///
+/// ```nabi
+/// let t = try table::read_csv_str("a,b\n1,x\n2,y\n") catch _ { table::Table::new() };
+/// assert(t.shape() == (2, 2));
+/// ```
+pub fn read_csv_str(s: str) throws (TableError) -> Table { try Csv::new().read_str(s) }
+
+/// Write the table as CSV to `path` with the default options.
+///
+/// ```nabi norun
+/// let t = table::table!{ "a": [1, 2] };
+/// try t |> table::write_csv("out.csv");
+/// ```
+pub fn write_csv(t: Table, path: str) throws (TableError) { try Csv::new().write_file(t, path) }
+
+/// Cell text per column, and the rows whose cell was a quoted null
+/// token (so a value, not a null).
+struct Raw {
+    cells: List<List<str>>;
+    kept: List<Set<usize>>;
+}
+
+impl Raw {
+    fn new(w: usize) -> Raw { Raw { cells: List::from_fn(w, |_| List::new()), kept: List::from_fn(w, |_| Set::new()) } }
+
+    fn len(self) -> usize { if self.cells.is_empty() { 0 } else { self.cells[0].len() } }
+}
+
+/// Records of a `csvio::Reader` turned into column cells.
+struct Rows {
+    o: Csv;
+    r: csvio::Reader;
+    rec: csvio::Record;
+    /// The first record, read for its width when there is no header.
+    first: bool;
+    /// Data rows seen so far (for messages).
+    row: usize;
+    done: bool;
+}
+
+impl Rows {
+    fn new(o: Csv, r: csvio::Reader) -> Rows { Rows { o, r, rec: csvio::Record::new(), first: false, row: 0, done: false } }
+
+    /// The header's names (or `column_1`, ... from the first record's width).
+    fn header_names(ref self) throws (TableError) -> List<str> {
+        if self.o.header {
+            let hs = (try self.r.headers() catch e { throw parse_error(e); }).names();
+            for k in 0..hs.len() {
+                for j in 0..k {
+                    if hs[j] == hs[k] {
+                        throw TableError::Parse { line: 1, col: 0, msg: f"the header names `{hs[k]}` twice; give each column its own name" };
+                    }
+                }
+            }
+            return hs;
+        }
+        // The first record gives the width and is kept for `records`.
+        if !(try self.next()) {
+            self.done = true;
+            return List::new();
+        }
+        self.first = true;
+        List::from_fn(self.rec.len(), |k| f"column_{k + 1}")
+    }
+
+    fn next(ref self) throws (TableError) -> bool {
+        try self.r.read(ref self.rec) catch e { throw parse_error(e); }
+    }
+
+    /// Up to `max` records into `raw` (one list per column); a record of
+    /// another width is an error.
+    fn records(ref self, raw: Raw, max: usize) throws (TableError) -> usize {
+        let w = raw.cells.len();
+        let got: usize = 0;
+        let nulls = self.o.nulls;
+        let cells = raw.cells;
+        // Locals in the loop: a call on `self` copies all of it.
+        let r = self.r;
+        let rec = self.rec;
+        let quoted: List<List<usize>> = List::from_fn(w, |_| List::new());
+        if self.first && got < max {
+            self.first = false;
+            push(rec, raw, nulls);
+            got += 1;
+        }
+        while got < max && !self.done {
+            // Whole columns at once, until a record of another width.
+            got += try r.read_columns(cells, quoted, max - got) catch e { throw parse_error(e); };
+            for k in 0..w {
+                for q in quoted[k] {
+                    if nulls.contains(cells[k][q]) { raw.kept[k].insert(q); }
+                }
+                quoted[k].clear();
+            }
+            if got >= max { break; }
+            if !(try r.read(ref rec) catch e { throw parse_error(e); }) {
+                self.done = true;
+                break;
+            }
+            let k = rec.len();
+            // A blank line is skipped (with one column it is an empty cell).
+            if k == 1 && w != 1 && !rec.is_quoted(0) && rec[0].is_empty() { continue; }
+            if k != w {
+                throw TableError::Parse { line: rec.line(), col: 0, msg: f"row {self.row + got + 1} has {k} fields but the header has {w}; give every row one field per column" };
+            }
+            push(rec, raw, nulls);
+            got += 1;
+        }
+        self.rec = rec;
+        self.row += got;
+        got
+    }
+}
+
+/// One record's cells into `raw`.
+fn push(rec: csvio::Record, raw: Raw, nulls: List<str>) {
+    for c in 0..raw.cells.len() {
+        let s = rec[c];
+        raw.cells[c].push(s);
+        if rec.is_quoted(c) && nulls.contains(s) { raw.kept[c].insert(raw.cells[c].len() - 1); }
+    }
+}
+
+/// A `csv` error as this package's.
+fn parse_error(e: csvio::CsvError) -> TableError {
+    match e.kind {
+        csvio::ErrorKind::Io => TableError::Io { msg: e.msg },
+        _ => TableError::Parse { line: e.line, col: e.column, msg: e.msg },
+    }
+}
+
+/// The type the non-null cells of `xs` fit, trying narrower types first.
+/// Cheap byte tests come before a full parse, and a cell that is an
+/// `i64` is not parsed again as `f64`.
+fn infer(xs: List<str>, nulls: List<str>, upto: usize) -> DType {
+    let cands = [true, true, true, true, true];
+    let any = false;
+    let m = xs.len().min(upto);
+    for i in 0..m {
+        let s = xs[i];
+        if nulls.contains(s) { continue; }
+        any = true;
+        let n = s.len();
+        if cands[0] && (!(n == 4 || n == 5) || (try? parse_bool(s)) is none) { cands[0] = false; }
+        let whole = cands[1] && looks_int(s) && (n < 19 || !((try? parse_i64(s)) is none));
+        if cands[1] && !whole { cands[1] = false; }
+        if cands[2] && !whole && (try? parse_f64(s)) is none { cands[2] = false; }
+        if cands[3] && (n != 10 || Date::parse(s) is none) { cands[3] = false; }
+        if cands[4] && (n < 10 || DateTime::parse(s) is none) { cands[4] = false; }
+        if !(cands[0] || cands[1] || cands[2] || cands[3] || cands[4]) { return DType::Str; }
+    }
+    if !any { return DType::Str; }
+    if cands[0] { DType::Bool } else if cands[1] { DType::I64 } else if cands[2] { DType::F64 } else if cands[3] { DType::Date } else if cands[4] { DType::DateTime } else { DType::Str }
+}
+
+/// An optional sign and 1 to 19 digits.
+fn looks_int(s: str) -> bool {
+    let n = s.len();
+    let i: usize = 0;
+    if n > 0 && (s.byte(0) == 0x2Du8 || s.byte(0) == 0x2Bu8) { i = 1; }
+    if i == n || n - i > 19 { return false; }
+    while i < n {
+        let b = s.byte(i);
+        if b < 0x30u8 || b > 0x39u8 { return false; }
+        i += 1;
+    }
+    true
+}
+
+/// Typed columns from raw text; `fixed` gives the types (streaming).
+/// `base` is the number of data rows before this batch (for messages).
+fn finish(o: Csv, names: List<str>, raw: Raw, fixed: List<DType> | none, base: usize) throws (TableError) -> Table {
+    let t = Table::new();
+    let n = raw.len();
+    // Most cells are longer than every null token: one length test.
+    let longest: usize = 0;
+    for z in o.nulls { longest = longest.max(z.len()); }
+    for k in 0..names.len() {
+        let xs = raw.cells[k];
+        let kept = raw.kept[k];
+        let dt = match fixed {
+            ts: List<DType> => ts[k],
+            none => o.types.get(names[k]) ?? infer(xs, o.nulls, usize::MAX),
+        };
+        let valid: List<bool> = List::new();
+        let nulls: usize = 0;
+        for i in 0..n {
+            let s = xs[i];
+            if s.len() <= longest && o.nulls.contains(s) && !kept.contains(i) {
+                if valid.is_empty() { valid = List::filled(n, true); }
+                valid[i] = false;
+                nulls += 1;
+            }
+        }
+        let ok = |i: usize| nulls == 0 || valid[i];
+        let bad = |i: usize, e: TableError| TableError::Parse {
+            line: 0, col: 0,
+            msg: f"column `{names[k]}`, row {base + i + 1}: {e} (the column was read as {dt}; set `Csv::types` to read it as `str`)",
+        };
+        let data: Data = match dt {
+            DType::Str => Data::Str(if nulls == 0 { xs } else { List::from_fn(n, |i| if valid[i] { xs[i] } else { "" }) }),
+            DType::Cat => Data::Str(if nulls == 0 { xs } else { List::from_fn(n, |i| if valid[i] { xs[i] } else { "" }) }),
+            DType::I64 => {
+                let out: List<i64> = List::filled(n, 0);
+                for i in 0..n {
+                    if ok(i) { out[i] = try parse_i64(xs[i]) catch _ { throw bad(i, TableError::invalid(f"`{xs[i]}` is not an i64")); }; }
+                }
+                Data::I64(out)
+            },
+            DType::F64 => {
+                let out: List<f64> = List::filled(n, 0.0);
+                for i in 0..n {
+                    if ok(i) { out[i] = try parse_f64(xs[i]) catch _ { throw bad(i, TableError::invalid(f"`{xs[i]}` is not a number")); }; }
+                }
+                Data::F64(out)
+            },
+            DType::Bool => {
+                let out: List<bool> = List::filled(n, false);
+                for i in 0..n {
+                    if ok(i) { out[i] = try parse_bool(xs[i]) catch _ { throw bad(i, TableError::invalid(f"`{xs[i]}` is not true / false")); }; }
+                }
+                Data::Bool(out)
+            },
+            DType::Date => {
+                let out: List<i32> = List::filled(n, 0i32);
+                for i in 0..n {
+                    if ok(i) { out[i] = (Date::parse(xs[i]) ?? throw bad(i, TableError::invalid(f"`{xs[i]}` is not a date (YYYY-MM-DD)"))).days; }
+                }
+                Data::Date(out)
+            },
+            DType::DateTime => {
+                let out: List<i64> = List::filled(n, 0);
+                for i in 0..n {
+                    if ok(i) { out[i] = (DateTime::parse(xs[i]) ?? throw bad(i, TableError::invalid(f"`{xs[i]}` is not a timestamp (YYYY-MM-DDTHH:MM:SS)"))).ns; }
+                }
+                Data::DateTime(out)
+            },
+        };
+        let c = if nulls == 0 { Column::of(data) } else { Column::with_valid(data, Bitmap::from_flags(valid)) };
+        t = try t.set_column(names[k], if dt == DType::Cat { c.to_cat() } else { c }, false);
+    }
+    t
+}
+
+/// Reads CSV from a stream in batches. Types come from the first
+/// `infer_rows` rows (or `Csv::types`); a later cell that does not fit
+/// is an error that says which column to fix.
+///
+/// ```nabi
+/// let t = table::table!{ "i": [1, 2, 3, 4, 5] };
+/// let text = table::Csv::new().write_str(t);
+/// let r = table::Csv::new().batch_rows(2).reader(core::io::Cursor::new(text.as_bytes().to_list()));
+/// let total = 0;
+/// loop {
+///     match try r.next() catch _ { none } {
+///         b: table::Table => { total += b.nrows(); },
+///         none => break,
+///     }
+/// }
+/// assert(total == 5);
+/// ```
+pub struct CsvReader {
+    opts: Csv;
+    p: Rows;
+    names: List<str> | none;
+    types: List<DType> | none;
+}
+
+impl CsvReader {
+    /// The column names (after the first `next`).
+    pub fn names(self) -> List<str> { self.names ?? List::new() }
+
+    /// The next batch of up to `batch` rows; `none` after the last.
+    pub fn next(ref self) throws (TableError) -> Table | none {
+        if self.names is none { self.names = try self.p.header_names(); }
+        let names = self.names ?? List::new();
+        let raw = Raw::new(names.len());
+        let base = self.p.row;
+        _ = try self.p.records(raw, self.opts.batch);
+        if raw.len() == 0 { return none; }
+        if self.types is none {
+            let ts: List<DType> = List::from_fn(names.len(), |k| self.opts.types.get(names[k]) ?? infer(raw.cells[k], self.opts.nulls, self.opts.infer_rows));
+            self.types = ts;
+        }
+        try finish(self.opts, names, raw, self.types, base)
+    }
+
+    /// Every remaining batch as one table.
+    pub fn read_all(ref self) throws (TableError) -> Table {
+        let out = Table::new();
+        loop {
+            match try self.next() {
+                b: Table => { out = try out.vstack(b); },
+                none => break,
+            }
+        }
+        out
+    }
+}

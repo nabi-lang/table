@@ -1,0 +1,812 @@
+//! Typed column storage: one packed `List` per column plus an optional
+//! validity bitmap. A column and a contiguous `Array<T, 1>` share one
+//! buffer, so `from_array` and `to_f64` copy nothing where they can.
+
+pub(pkg) mod bitmap;
+
+use pkg::column::bitmap::Bitmap;
+use pkg::{Date, DateTime, DType, TableError, Value};
+use core::array::Array;
+
+/// The storage of a column. `Cat` is a code per row into `levels`.
+#[derive(Clone)]
+pub(pkg) enum Data {
+    I64(List<i64>),
+    F64(List<f64>),
+    Bool(List<bool>),
+    Str(List<str>),
+    Cat(List<u32>, List<str>),
+    Date(List<i32>),
+    DateTime(List<i64>),
+}
+
+/// One typed column. Nulls are tracked by a validity bitmap; the slot
+/// under a null holds a zero value. Columns share their buffers when
+/// copied: they are read-only once built.
+///
+/// ```nabi
+/// let c = table::Column::from([1.5, 2.5, 4.0]);
+/// assert(c.dtype() == table::DType::F64);
+/// let a = try c.to_f64() catch _ { [0.0] };
+/// assert(a.sum() == 8.0);
+/// ```
+#[derive(Clone)]
+pub struct Column {
+    pub(pkg) data: Data;
+    pub(pkg) valid: Bitmap | none;
+}
+
+pub(pkg) fn arr<T>(xs: List<T>) -> Array<T, 1> { Array::view_list(xs, [xs.len()]) }
+
+/// The elements of `a`, sharing its buffer when it is contiguous.
+fn list_of<T>(a: Array<T, 1>) -> List<T> {
+    match a.as_list() {
+        xs: List<T> => xs,
+        none => a.to_list(),
+    }
+}
+
+impl Column {
+    pub(pkg) fn of(data: Data) -> Column { Column { data, valid: none } }
+
+    pub(pkg) fn with_valid(data: Data, valid: Bitmap) -> Column {
+        if valid.nulls() == 0 { Column { data, valid: none } } else { Column { data, valid } }
+    }
+
+    /// An `i64` column.
+    pub fn i64s(xs: List<i64>) -> Column { Column::of(Data::I64(xs)) }
+
+    /// An `f64` column. NaN is a value, not a null.
+    pub fn f64s(xs: List<f64>) -> Column { Column::of(Data::F64(xs)) }
+
+    /// A `bool` column.
+    pub fn bools(xs: List<bool>) -> Column { Column::of(Data::Bool(xs)) }
+
+    /// A `str` column.
+    pub fn strs(xs: List<str>) -> Column { Column::of(Data::Str(xs)) }
+
+    /// A `date` column.
+    pub fn dates(xs: List<Date>) -> Column { Column::of(Data::Date(xs.iter().map(|d| d.days).collect())) }
+
+    /// A `datetime` column.
+    pub fn datetimes(xs: List<DateTime>) -> Column { Column::of(Data::DateTime(xs.iter().map(|t| t.ns).collect())) }
+
+    /// A categorical column: each distinct string stored once, a `u32`
+    /// code per row.
+    ///
+    /// ```nabi
+    /// let c = table::Column::cat(["red", "blue", "red"]);
+    /// assert(c.dtype() == table::DType::Cat);
+    /// assert(c.levels() == ["red", "blue"]);
+    /// ```
+    pub fn cat(xs: List<str>) -> Column { Column::strs(xs).to_cat() }
+
+    /// The `f64` array `a` as a column. A contiguous array shares its
+    /// buffer with the column (no copy), so write to `a.copy()` instead
+    /// of `a` once it is in a table; a strided view is copied.
+    ///
+    /// ```nabi
+    /// use core::array::Array;
+    /// let a: Array<f64, 1> = [1.0, 2.0];
+    /// assert(table::Column::from_array(a).len() == 2);
+    /// ```
+    pub fn from_array(a: Array<f64, 1>) -> Column { Column::of(Data::F64(list_of(a))) }
+
+    /// The `i64` array `a` as a column, sharing its buffer as
+    /// `from_array` does.
+    pub fn from_i64_array(a: Array<i64, 1>) -> Column { Column::of(Data::I64(list_of(a))) }
+
+    /// The `bool` array `a` as a column, sharing its buffer as
+    /// `from_array` does.
+    pub fn from_bool_array(a: Array<bool, 1>) -> Column { Column::of(Data::Bool(list_of(a))) }
+
+    /// `n` nulls of type `t`.
+    pub fn nulls(t: DType, n: usize) -> Column {
+        let data = match t {
+            DType::I64 => Data::I64(List::filled(n, 0)),
+            DType::F64 => Data::F64(List::filled(n, 0.0)),
+            DType::Bool => Data::Bool(List::filled(n, false)),
+            DType::Str => Data::Str(List::filled(n, "")),
+            DType::Cat => Data::Cat(List::filled(n, 0u32), List::new()),
+            DType::Date => Data::Date(List::filled(n, 0i32)),
+            DType::DateTime => Data::DateTime(List::filled(n, 0)),
+        };
+        Column { data, valid: if n == 0 { none } else { Bitmap::from_flags(List::filled(n, false)) } }
+    }
+
+    /// Cells of one type, `Value::Null` for a missing one. The type is
+    /// the first non-null cell's; `Int` and `Float` mixed give `f64`.
+    /// All-null input gives `t` (`F64` when `t` is `none`).
+    ///
+    /// ```nabi
+    /// use table::Value;
+    /// let c = try table::Column::from_values([Value::Int(1), Value::Null, Value::Float(2.5)], none) catch _ { table::Column::f64s([]) };
+    /// assert(c.dtype() == table::DType::F64 && c.null_count() == 1);
+    /// ```
+    pub fn from_values(vs: List<Value>, t: DType | none) throws (TableError) -> Column {
+        let dt: DType | none = t;
+        if dt is none {
+            for v in vs {
+                if let d: DType = v.dtype() {
+                    if dt is none {
+                        dt = d;
+                    } else if dt != d {
+                        let a = dt ?? d;
+                        if a.is_numeric() && d.is_numeric() {
+                            dt = DType::F64;
+                        } else {
+                            throw TableError::invalid(f"cells mix {a} and {d}; give the column one type, or read it as `str`");
+                        }
+                    }
+                }
+            }
+        }
+        let b = Builder::new(dt ?? DType::F64, vs.len());
+        for i in 0..vs.len() {
+            try b.push(vs[i]) catch e { throw TableError::invalid(f"row {i}: {e}"); };
+        }
+        try b.finish()
+    }
+
+    /// The number of rows.
+    pub fn len(self) -> usize {
+        match self.data {
+            Data::I64(a) => a.len(),
+            Data::F64(a) => a.len(),
+            Data::Bool(a) => a.len(),
+            Data::Str(a) => a.len(),
+            Data::Cat(a, _) => a.len(),
+            Data::Date(a) => a.len(),
+            Data::DateTime(a) => a.len(),
+        }
+    }
+
+    /// No rows.
+    pub fn is_empty(self) -> bool { self.len() == 0 }
+
+    /// The column type.
+    pub fn dtype(self) -> DType {
+        match self.data {
+            Data::I64(_) => DType::I64,
+            Data::F64(_) => DType::F64,
+            Data::Bool(_) => DType::Bool,
+            Data::Str(_) => DType::Str,
+            Data::Cat(_, _) => DType::Cat,
+            Data::Date(_) => DType::Date,
+            Data::DateTime(_) => DType::DateTime,
+        }
+    }
+
+    /// How many rows are null.
+    pub fn null_count(self) -> usize {
+        match self.valid {
+            b: Bitmap => b.nulls(),
+            none => 0,
+        }
+    }
+
+    /// Whether row `i` is null.
+    pub fn is_null(self, i: usize) -> bool {
+        match self.valid {
+            b: Bitmap => !b.get(i),
+            none => false,
+        }
+    }
+
+    /// Whether row `i` holds a value.
+    pub fn is_valid(self, i: usize) -> bool { !self.is_null(i) }
+
+    /// Row `i` as a cell; `Value::Null` for a null or `i` past the end.
+    pub fn get(self, i: usize) -> Value {
+        if i >= self.len() || self.is_null(i) {
+            return Value::Null;
+        }
+        match self.data {
+            Data::I64(a) => Value::Int(a[i]),
+            Data::F64(a) => Value::Float(a[i]),
+            Data::Bool(a) => Value::Bool(a[i]),
+            Data::Str(a) => Value::Str(a[i]),
+            Data::Cat(a, lv) => Value::Str(lv[a[i] as usize]),
+            Data::Date(a) => Value::Date(Date { days: a[i] }),
+            Data::DateTime(a) => Value::DateTime(DateTime { ns: a[i] }),
+        }
+    }
+
+    /// The cells in order.
+    pub fn values(self) -> List<Value> { List::from_fn(self.len(), |i| self.get(i)) }
+
+    /// The distinct strings of a `Cat` column, in code order; empty for
+    /// other types.
+    pub fn levels(self) -> List<str> {
+        match self.data {
+            Data::Cat(_, lv) => lv,
+            _ => List::new(),
+        }
+    }
+
+    fn wrong(self, want: str) -> TableError { TableError::mismatch("", want, self.dtype().name()) }
+
+    /// The values of a numeric column as an `f64` array; `i64` converts
+    /// and nulls read as NaN. An `f64` column without nulls shares its
+    /// buffer with the array (no copy): treat it as read-only, since a
+    /// write would change every table holding the column, and write to
+    /// `a.copy()` instead.
+    pub fn to_f64(self) throws (TableError) -> Array<f64, 1> { arr(try self.f64_list()) }
+
+    /// As `to_f64`, as a list.
+    pub fn f64_list(self) throws (TableError) -> List<f64> {
+        let (a, fresh) = match self.data {
+            Data::F64(a) => (a, false),
+            Data::I64(a) => (mapl(a, |x| x as f64), true),
+            _ => throw self.wrong("f64"),
+        };
+        if let b: Bitmap = self.valid {
+            let c = if fresh { a } else { a.clone() };
+            for i in 0..c.len() {
+                if !b.get(i) { c[i] = f64::NAN; }
+            }
+            return c;
+        }
+        a
+    }
+
+    /// The values of an `i64` column as an array sharing the column's
+    /// buffer (read-only, as for `to_f64`); nulls read as 0.
+    pub fn to_i64(self) throws (TableError) -> Array<i64, 1> {
+        match self.data {
+            Data::I64(a) => arr(a),
+            _ => throw self.wrong("i64"),
+        }
+    }
+
+    /// The values of a `bool` column as an array sharing the column's
+    /// buffer (read-only, as for `to_f64`); nulls read as `false`.
+    pub fn to_bool(self) throws (TableError) -> Array<bool, 1> {
+        match self.data {
+            Data::Bool(a) => arr(a),
+            _ => throw self.wrong("bool"),
+        }
+    }
+
+    /// The strings of a `str` or `cat` column; nulls read as `""`.
+    pub fn to_strs(self) throws (TableError) -> List<str> {
+        match self.data {
+            Data::Str(a) => a,
+            Data::Cat(a, lv) => List::from_fn(a.len(), |i| if self.is_null(i) { "" } else { lv[a[i] as usize] }),
+            _ => throw self.wrong("str"),
+        }
+    }
+
+    /// The column with every cell `none` where it is null.
+    ///
+    /// ```nabi
+    /// let c = table::column![1, none, 3];
+    /// assert(c.to_options_i64() == [1, none, 3]);
+    /// ```
+    pub fn to_options_i64(self) -> List<i64 | none> {
+        List::from_fn(self.len(), |i| self.get(i).as_i64())
+    }
+
+    /// As `to_options_i64`, for numbers as `f64`.
+    pub fn to_options_f64(self) -> List<f64 | none> {
+        List::from_fn(self.len(), |i| self.get(i).as_f64())
+    }
+
+    /// As `to_options_i64`, for text.
+    pub fn to_options_str(self) -> List<str | none> {
+        List::from_fn(self.len(), |i| self.get(i).as_str())
+    }
+
+    /// Dictionary-encode a `str` column (others are returned as they
+    /// are). Levels keep first-seen order.
+    pub fn to_cat(self) -> Column {
+        let xs = match self.data {
+            Data::Str(xs) => xs,
+            _ => return self,
+        };
+        let codes: List<u32> = List::with_capacity(xs.len());
+        let levels: List<str> = List::new();
+        let seen: Dict<str, u32> = Dict::new();
+        for i in 0..xs.len() {
+            if self.is_null(i) {
+                codes.push(0u32);
+                continue;
+            }
+            let s = xs[i];
+            let c = match seen.get(s) {
+                c: u32 => c,
+                none => {
+                    let c = levels.len() as u32;
+                    levels.push(s);
+                    _ = seen.insert(s, c);
+                    c
+                },
+            };
+            codes.push(c);
+        }
+        Column { data: Data::Cat(codes, levels), valid: self.valid }
+    }
+
+    /// The column as type `t`. Numbers convert between `i64` and `f64`
+    /// (`f64` to `i64` truncates toward zero; NaN and out-of-range
+    /// values are an error), anything converts to `str`, and `str`
+    /// parses into the other types (an unparseable cell is an error
+    /// naming the row).
+    ///
+    /// ```nabi
+    /// let c = table::Column::from(["1", "2", "x"]);
+    /// assert((try c.cast(table::DType::I64) catch _ { c }).dtype() == table::DType::Str);
+    /// let n = try table::Column::from(["1", "2"]).cast(table::DType::F64) catch _ { c };
+    /// assert(n.dtype() == table::DType::F64);
+    /// ```
+    pub fn cast(self, t: DType) throws (TableError) -> Column {
+        let from = self.dtype();
+        if from == t {
+            return self;
+        }
+        if t == DType::Cat {
+            return (try self.cast(DType::Str)).to_cat();
+        }
+        if from == DType::Cat {
+            return try self.decat().cast(t);
+        }
+        let n = self.len();
+        let data = match (self.data, t) {
+            (Data::I64(a), DType::F64) => Data::F64(mapl(a, |x| x as f64)),
+            (Data::Bool(a), DType::I64) => Data::I64(mapl(a, |x| if x { 1 } else { 0 })),
+            (Data::Bool(a), DType::F64) => Data::F64(mapl(a, |x| if x { 1.0 } else { 0.0 })),
+            (Data::F64(a), DType::I64) => {
+                let out: List<i64> = List::with_capacity(n);
+                for i in 0..n {
+                    let x = a[i];
+                    if self.is_valid(i) && (x.is_nan() || x >= 9223372036854775808.0 || x < -9223372036854775808.0) {
+                        throw TableError::invalid(f"row {i}: {x} does not fit in i64");
+                    }
+                    out.push(if self.is_valid(i) { x as i64 } else { 0 });
+                }
+                Data::I64(out)
+            },
+            (Data::Date(a), DType::DateTime) => Data::DateTime(mapl(a, |d| d as i64 * 86400000000000)),
+            (Data::DateTime(a), DType::Date) => Data::Date(mapl(a, |x| x.div_euclid(86400000000000) as i32)),
+            (_, DType::Str) => Data::Str(List::from_fn(n, |i| if self.is_null(i) { "" } else { f"{self.get(i)}" })),
+            (Data::Str(xs), _) => {
+                let b = Builder::new(t, n);
+                for i in 0..n {
+                    if self.is_null(i) {
+                        b.push_null();
+                    } else {
+                        try b.push_text(xs[i]) catch e { throw TableError::invalid(f"row {i}: {e}"); };
+                    }
+                }
+                return try b.finish();
+            },
+            _ => throw TableError::invalid(f"cannot convert {from} to {t}; go through `str` with two casts if the text form converts"),
+        };
+        Column { data, valid: self.valid }
+    }
+
+    /// A `Cat` column as plain `str`.
+    pub(pkg) fn decat(self) -> Column {
+        match self.data {
+            Data::Cat(a, lv) => Column {
+                data: Data::Str(List::from_fn(a.len(), |i| if self.is_null(i) { "" } else { lv[a[i] as usize] })),
+                valid: self.valid,
+            },
+            _ => self,
+        }
+    }
+
+    /// Rows `start..end` (clamped to the length), sharing the buffer.
+    pub fn slice(self, start: usize, end: usize) -> Column {
+        let n = self.len();
+        let e = end.min(n);
+        let s = start.min(e);
+        let data = match self.data {
+            Data::I64(x) => Data::I64(x[s:e].to_list()),
+            Data::F64(x) => Data::F64(x[s:e].to_list()),
+            Data::Bool(x) => Data::Bool(x[s:e].to_list()),
+            Data::Str(x) => Data::Str(x[s:e].to_list()),
+            Data::Cat(x, lv) => Data::Cat(x[s:e].to_list(), lv),
+            Data::Date(x) => Data::Date(x[s:e].to_list()),
+            Data::DateTime(x) => Data::DateTime(x[s:e].to_list()),
+        };
+        let valid: Bitmap | none = match self.valid {
+            v: Bitmap => v.slice(s, e),
+            none => none,
+        };
+        Column { data, valid }
+    }
+
+    /// The rows at `idx`, in that order (a gather).
+    pub fn take(self, idx: List<usize>) -> Column {
+        let n = idx.len();
+        let data = match self.data {
+            Data::I64(x) => Data::I64(gather(x, idx)),
+            Data::F64(x) => Data::F64(gather(x, idx)),
+            Data::Bool(x) => Data::Bool(gather(x, idx)),
+            Data::Str(x) => Data::Str(List::from_fn(n, |j| x[idx[j]])),
+            Data::Cat(x, lv) => Data::Cat(gather(x, idx), lv),
+            Data::Date(x) => Data::Date(gather(x, idx)),
+            Data::DateTime(x) => Data::DateTime(gather(x, idx)),
+        };
+        let valid: Bitmap | none = match self.valid {
+            v: Bitmap => v.take(idx),
+            none => none,
+        };
+        Column::with_opt(data, valid)
+    }
+
+    /// The rows at `idx`, where a negative index gives a null (the
+    /// unmatched side of an outer join).
+    pub(pkg) fn take_or_null(self, idx: List<i64>) -> Column {
+        let n = idx.len();
+        let flags: List<bool> = List::with_capacity(n);
+        let safe: List<usize> = List::with_capacity(n);
+        let any_null = false;
+        for j in 0..n {
+            let k = idx[j];
+            if k < 0 {
+                safe.push(0);
+                flags.push(false);
+                any_null = true;
+            } else {
+                safe.push(k as usize);
+                flags.push(self.is_valid(k as usize));
+            }
+        }
+        if self.len() == 0 {
+            return Column::nulls(self.dtype(), n);
+        }
+        let c = self.take(safe);
+        if any_null || !(self.valid is none) {
+            c.valid = Bitmap::from_flags(flags);
+            return Column::with_opt(c.data, c.valid);
+        }
+        c
+    }
+
+    pub(pkg) fn with_opt(data: Data, valid: Bitmap | none) -> Column {
+        match valid {
+            b: Bitmap => Column::with_valid(data, b),
+            none => Column { data, valid: none },
+        }
+    }
+
+    /// The rows where `mask` is `true`.
+    pub fn filter(self, mask: List<bool>) -> Column {
+        let idx: List<usize> = List::new();
+        for i in 0..mask.len() {
+            if mask[i] { idx.push(i); }
+        }
+        self.take(idx)
+    }
+
+    /// `self` then `o`; both must have one type (`i64` with `f64` gives
+    /// `f64`, `cat` with `str` gives `str`).
+    pub fn concat(self, o: Column) throws (TableError) -> Column {
+        let a = self;
+        let b = o;
+        if a.dtype() != b.dtype() {
+            if a.dtype().is_numeric() && b.dtype().is_numeric() {
+                a = try a.cast(DType::F64);
+                b = try b.cast(DType::F64);
+            } else if a.dtype().is_text() && b.dtype().is_text() {
+                a = a.decat();
+                b = b.decat();
+            } else {
+                throw TableError::mismatch("", a.dtype().name(), b.dtype().name());
+            }
+        }
+        let data = match (a.data, b.data) {
+            (Data::I64(x), Data::I64(y)) => Data::I64(join(x, y)),
+            (Data::F64(x), Data::F64(y)) => Data::F64(join(x, y)),
+            (Data::Bool(x), Data::Bool(y)) => Data::Bool(join(x, y)),
+            (Data::Str(x), Data::Str(y)) => {
+                let out = List::with_capacity(x.len() + y.len());
+                out.extend(x);
+                out.extend(y);
+                Data::Str(out)
+            },
+            (Data::Cat(x, lx), Data::Cat(y, ly)) => {
+                // Remap y's codes into x's levels.
+                let levels = lx.clone();
+                let pos: Dict<str, u32> = Dict::new();
+                for k in 0..levels.len() {
+                    _ = pos.insert(levels[k], k as u32);
+                }
+                let map: List<u32> = List::with_capacity(ly.len());
+                for s in ly {
+                    let c = match pos.get(s) {
+                        c: u32 => c,
+                        none => {
+                            let c = levels.len() as u32;
+                            levels.push(s);
+                            _ = pos.insert(s, c);
+                            c
+                        },
+                    };
+                    map.push(c);
+                }
+                let codes: List<u32> = x.clone();
+                for j in 0..y.len() {
+                    codes.push(if b.is_null(j) { 0u32 } else { map[y[j] as usize] });
+                }
+                Data::Cat(codes, levels)
+            },
+            (Data::Date(x), Data::Date(y)) => Data::Date(join(x, y)),
+            (Data::DateTime(x), Data::DateTime(y)) => Data::DateTime(join(x, y)),
+            _ => throw TableError::invalid("internal: concat of different storage"),
+        };
+        let valid: Bitmap | none = if a.valid is none && b.valid is none {
+            none
+        } else {
+            a.bitmap().concat(b.bitmap())
+        };
+        Column::with_opt(data, valid)
+    }
+
+    /// The validity as a bitmap, all set when there are no nulls.
+    pub(pkg) fn bitmap(self) -> Bitmap {
+        match self.valid {
+            b: Bitmap => b,
+            none => Bitmap::all(self.len()),
+        }
+    }
+
+    /// One flag per row, `true` where it holds a value.
+    pub fn validity(self) -> List<bool> { List::from_fn(self.len(), |i| self.is_valid(i)) }
+}
+
+pub(pkg) fn mapl<T, U>(xs: List<T>, f: fn(T) -> U) -> List<U> {
+    let out: List<U> = List::with_capacity(xs.len());
+    for x in xs {
+        out.push(f(x));
+    }
+    out
+}
+
+fn gather<T>(x: List<T>, idx: List<usize>) -> List<T> {
+    let out: List<T> = List::with_capacity(idx.len());
+    for i in idx {
+        out.push(x[i]);
+    }
+    out
+}
+
+fn join<T>(x: List<T>, y: List<T>) -> List<T> {
+    let out: List<T> = List::with_capacity(x.len() + y.len());
+    out.extend(x);
+    out.extend(y);
+    out
+}
+
+/// Grows a column of one type cell by cell (CSV / JSON readers, rows).
+pub(pkg) struct Builder {
+    pub(pkg) t: DType;
+    i64s: List<i64>;
+    f64s: List<f64>;
+    bools: List<bool>;
+    strs: List<str>;
+    valid: Bitmap;
+    nulls: usize;
+}
+
+impl Builder {
+    pub(pkg) fn new(t: DType, cap: usize) -> Builder {
+        let b = Builder {
+            t, i64s: List::new(), f64s: List::new(), bools: List::new(), strs: List::new(),
+            valid: Bitmap { words: List::with_capacity(cap / 64 + 1), len: 0 }, nulls: 0,
+        };
+        match t {
+            DType::I64 => b.i64s.reserve(cap),
+            DType::Date => b.i64s.reserve(cap),
+            DType::DateTime => b.i64s.reserve(cap),
+            DType::F64 => b.f64s.reserve(cap),
+            DType::Bool => b.bools.reserve(cap),
+            _ => b.strs.reserve(cap),
+        }
+        b
+    }
+
+    pub(pkg) fn push_null(ref self) {
+        match self.t {
+            DType::F64 => self.f64s.push(0.0),
+            DType::Bool => self.bools.push(false),
+            DType::Str => self.strs.push(""),
+            DType::Cat => self.strs.push(""),
+            _ => self.i64s.push(0),
+        }
+        self.valid.push(false);
+        self.nulls += 1;
+    }
+
+    /// One cell; a cell of another type is an error naming both.
+    pub(pkg) fn push(ref self, v: Value) throws (TableError) {
+        let t = self.t;
+        match v {
+            Value::Null => {
+                self.push_null();
+                return;
+            },
+            Value::Int(n) => {
+                if t == DType::I64 { self.i64s.push(n); } else if t == DType::F64 { self.f64s.push(n as f64); } else { throw self.bad(v); }
+            },
+            Value::Float(x) => {
+                if t == DType::F64 { self.f64s.push(x); } else { throw self.bad(v); }
+            },
+            Value::Bool(b) => {
+                if t == DType::Bool { self.bools.push(b); } else { throw self.bad(v); }
+            },
+            Value::Str(s) => {
+                if t.is_text() { self.strs.push(s); } else { throw self.bad(v); }
+            },
+            Value::Date(d) => {
+                if t == DType::Date { self.i64s.push(d.days as i64); } else { throw self.bad(v); }
+            },
+            Value::DateTime(x) => {
+                if t == DType::DateTime { self.i64s.push(x.ns); } else { throw self.bad(v); }
+            },
+        }
+        self.valid.push(true);
+    }
+
+    fn bad(self, v: Value) -> TableError {
+        TableError::mismatch("", self.t.name(), (v.dtype() ?? DType::Str).name())
+    }
+
+    /// One cell from text: parsed as the builder's type.
+    pub(pkg) fn push_text(ref self, s: str) throws (TableError) {
+        match self.t {
+            DType::Str => self.strs.push(s),
+            DType::Cat => self.strs.push(s),
+            DType::I64 => self.i64s.push(try parse_i64(s) catch _ { throw TableError::invalid(f"`{s}` is not an i64"); }),
+            DType::F64 => self.f64s.push(try parse_f64(s) catch _ { throw TableError::invalid(f"`{s}` is not a number"); }),
+            DType::Bool => self.bools.push(try parse_bool(s) catch _ { throw TableError::invalid(f"`{s}` is not true / false"); }),
+            DType::Date => self.i64s.push((Date::parse(s) ?? throw TableError::invalid(f"`{s}` is not a date (YYYY-MM-DD)")).days as i64),
+            DType::DateTime => self.i64s.push((DateTime::parse(s) ?? throw TableError::invalid(f"`{s}` is not a timestamp (YYYY-MM-DDTHH:MM:SS)")).ns),
+        }
+        self.valid.push(true);
+    }
+
+    pub(pkg) fn len(self) -> usize { self.valid.len }
+
+    pub(pkg) fn finish(self) throws (TableError) -> Column {
+        let data = match self.t {
+            DType::I64 => Data::I64(self.i64s),
+            DType::F64 => Data::F64(self.f64s),
+            DType::Bool => Data::Bool(self.bools),
+            DType::Str => Data::Str(self.strs),
+            DType::Cat => Data::Str(self.strs),
+            DType::Date => Data::Date(self.i64s.iter().map(|x| x as i32).collect()),
+            DType::DateTime => Data::DateTime(self.i64s),
+        };
+        let c = if self.nulls == 0 { Column { data, valid: none } } else { Column { data, valid: self.valid } };
+        if self.t == DType::Cat { c.to_cat() } else { c }
+    }
+}
+
+/// A decimal integer with an optional sign.
+pub(pkg) fn parse_i64(s: str) throws (TableError) -> i64 {
+    let n = s.len();
+    if n == 0 { throw TableError::invalid("empty"); }
+    let i: usize = 0;
+    let neg = false;
+    let b0 = s.byte(0);
+    if b0 == 0x2Du8 || b0 == 0x2Bu8 {
+        neg = b0 == 0x2Du8;
+        i = 1;
+        if n == 1 { throw TableError::invalid("sign only"); }
+    }
+    let v: i64 = 0;
+    while i < n {
+        let b = s.byte(i);
+        if b < 0x30u8 || b > 0x39u8 { throw TableError::invalid("digit"); }
+        let d = (b - 0x30u8) as i64;
+        v = (v.checked_mul(10) ?? throw TableError::invalid("range")).checked_add(if neg { -d } else { d }) ?? throw TableError::invalid("range");
+        if neg && v > 0 { v = -v; }
+        i += 1;
+    }
+    v
+}
+
+/// A float: decimal, exponent, `inf` / `-inf` / `nan` (any case).
+pub(pkg) fn parse_f64(s: str) throws (TableError) -> f64 {
+    try s.parse::<f64>() catch _ {
+        let l = s.to_lowercase();
+        if l == "nan" { return f64::NAN; }
+        if l == "inf" || l == "+inf" || l == "infinity" { return f64::INFINITY; }
+        if l == "-inf" || l == "-infinity" { return f64::NEG_INFINITY; }
+        throw TableError::invalid("number");
+    }
+}
+
+/// `true` / `false` in any case.
+pub(pkg) fn parse_bool(s: str) throws (TableError) -> bool {
+    let n = s.len();
+    if n == 4 && (s == "true" || s == "True" || s == "TRUE") { return true; }
+    if n == 5 && (s == "false" || s == "False" || s == "FALSE") { return false; }
+    throw TableError::invalid("bool");
+}
+
+impl From<List<i64>> for Column {
+    fn from(xs: List<i64>) -> Column { Column::i64s(xs) }
+}
+
+impl From<List<f64>> for Column {
+    fn from(xs: List<f64>) -> Column { Column::f64s(xs) }
+}
+
+impl From<List<bool>> for Column {
+    fn from(xs: List<bool>) -> Column { Column::bools(xs) }
+}
+
+impl From<List<str>> for Column {
+    fn from(xs: List<str>) -> Column { Column::strs(xs) }
+}
+
+impl From<List<Date>> for Column {
+    fn from(xs: List<Date>) -> Column { Column::dates(xs) }
+}
+
+impl From<List<DateTime>> for Column {
+    fn from(xs: List<DateTime>) -> Column { Column::datetimes(xs) }
+}
+
+impl From<Array<f64, 1>> for Column {
+    fn from(a: Array<f64, 1>) -> Column { Column::from_array(a) }
+}
+
+impl From<Array<i64, 1>> for Column {
+    fn from(a: Array<i64, 1>) -> Column { Column::from_i64_array(a) }
+}
+
+impl From<Array<bool, 1>> for Column {
+    fn from(a: Array<bool, 1>) -> Column { Column::from_bool_array(a) }
+}
+
+/// `none` cells become nulls.
+impl From<List<i64 | none>> for Column {
+    fn from(xs: List<i64 | none>) -> Column {
+        let flags: List<bool> = xs.iter().map(|x| !(x is none)).collect();
+        Column::with_valid(Data::I64(xs.iter().map(|x| x ?? 0).collect()), Bitmap::from_flags(flags))
+    }
+}
+
+impl From<List<f64 | none>> for Column {
+    fn from(xs: List<f64 | none>) -> Column {
+        let flags: List<bool> = xs.iter().map(|x| !(x is none)).collect();
+        Column::with_valid(Data::F64(xs.iter().map(|x| x ?? 0.0).collect()), Bitmap::from_flags(flags))
+    }
+}
+
+impl From<List<bool | none>> for Column {
+    fn from(xs: List<bool | none>) -> Column {
+        let flags: List<bool> = xs.iter().map(|x| !(x is none)).collect();
+        Column::with_valid(Data::Bool(xs.iter().map(|x| x ?? false).collect()), Bitmap::from_flags(flags))
+    }
+}
+
+impl From<List<str | none>> for Column {
+    fn from(xs: List<str | none>) -> Column {
+        let flags: List<bool> = xs.iter().map(|x| !(x is none)).collect();
+        Column::with_valid(Data::Str(xs.iter().map(|x| x ?? "").collect()), Bitmap::from_flags(flags))
+    }
+}
+
+/// Element-wise equal, nulls in the same rows.
+impl PartialEq for Column {
+    fn eq(self, o: Column) -> bool {
+        if self.len() != o.len() || self.dtype() != o.dtype() { return false; }
+        for i in 0..self.len() {
+            if self.get(i) != o.get(i) { return false; }
+        }
+        true
+    }
+}
+
+impl Debug for Column {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let cells: List<str> = self.values().iter().map(|v| f"{v}").collect();
+        try f.write_str(f"Column<{self.dtype()}>[{cells.join(", ")}]")
+    }
+}

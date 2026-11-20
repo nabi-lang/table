@@ -1,0 +1,162 @@
+// Group-by and every aggregation, nulls, empty tables, and the
+// partitioned path against the sequential one.
+
+use pkg::{Column, DType, Table, Value, count, count_of, custom, first, last, max, mean, median, min, n_unique, quantile, std, sum, var};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn agg(t: Table, keys: List<str>, aggs: List<pkg::Agg>) -> Table {
+    try (try t.group_by(keys)).agg(aggs) catch e { panic(f"{e}"); }
+}
+
+#[test]
+fn every_aggregation() {
+    let t = pkg::table!{
+        "g": ["a", "b", "a", "a", "b", "c"],
+        "x": [1.0, 2.0, 3.0, none, 4.0, none],
+        "i": [5, 1, 7, 2, 9, 4],
+        "s": ["p", "q", "p", "r", none, "z"],
+    };
+    let r = agg(t, ["g"], [count(), count_of("x"), sum("x"), sum("i"), mean("x"), min("x"), max("i"), std("x"), var("i"),
+        median("i"), quantile("i", 0.25), first("x"), last("x"), n_unique("s"), min("s"), max("s")]);
+    assert(r.column_at(0).to_options_str() == ["a", "b", "c"]);
+    let at = |name: str| (try r.column(name) catch e { panic(f"{e}"); }).values();
+    assert(at("count") == [Value::Int(3), Value::Int(2), Value::Int(1)]);
+    assert(at("x_count") == [Value::Int(2), Value::Int(2), Value::Int(0)]);
+    assert(at("x_sum") == [Value::Float(4.0), Value::Float(6.0), Value::Float(0.0)]);
+    assert(at("i_sum") == [Value::Int(14), Value::Int(10), Value::Int(4)]);
+    assert(at("x_mean") == [Value::Float(2.0), Value::Float(3.0), Value::Null]);
+    assert(at("x_min") == [Value::Float(1.0), Value::Float(2.0), Value::Null]);
+    assert(at("i_max") == [Value::Int(7), Value::Int(9), Value::Int(4)]);
+    let sd = at("x_std");
+    assert(((sd[0].as_f64() ?? 0.0) - 2.0f64.sqrt()).abs() < 1e-12 && sd[2] == Value::Null);
+    assert(at("i_var")[1] == Value::Float(32.0));
+    assert(at("i_median") == [Value::Float(5.0), Value::Float(5.0), Value::Float(4.0)]);
+    assert(at("i_q0.25")[0] == Value::Float(3.5));
+    assert(at("x_first") == [Value::Float(1.0), Value::Float(2.0), Value::Null]);
+    assert(at("x_last") == [Value::Float(3.0), Value::Float(4.0), Value::Null]);
+    assert(at("s_n_unique") == [Value::Int(2), Value::Int(1), Value::Int(1)]);
+    assert(at("s_min") == [Value::Str("p"), Value::Str("q"), Value::Str("z")]);
+    assert(at("s_max")[0] == Value::Str("r"));
+}
+
+#[test]
+fn custom_and_named() {
+    let t = pkg::table!{ "g": [1, 2, 1], "x": [3.0, 5.0, 4.0] };
+    let spread = custom("x", "spread", |c| {
+        let xs = try c.f64_list() catch _ { [0.0] };
+        let hi = xs.iter().fold(f64::NEG_INFINITY, |a, b| a.max(b));
+        let lo = xs.iter().fold(f64::INFINITY, |a, b| a.min(b));
+        Value::Float(hi - lo)
+    });
+    let r = agg(t, ["g"], [spread, mean("x").named("avg")]);
+    assert(r.names() == ["g", "spread", "avg"]);
+    assert(r.column_at(1).to_options_f64() == [1.0, 0.0]);
+    assert(r.row(0).f64("avg") == 3.5);
+}
+
+#[test]
+fn null_and_multi_keys() {
+    let t = pkg::table!{ "a": [1, none, 1, none, 2], "b": ["x", "y", "x", "y", "x"], "v": [1, 2, 3, 4, 5] };
+    let r = agg(t, ["a"], [sum("v")]);
+    assert(r.column_at(0).to_options_i64() == [1, none, 2]);
+    assert(r.column_at(1).to_options_i64() == [4, 6, 5]);
+    let m = agg(t, ["b", "a"], [count()]);
+    assert(m.nrows() == 3);
+    let g = try t.group_by(["a", "b"]) catch e { panic(f"{e}"); };
+    assert(g.len() == 3 && g.group_ids() == [0u32, 1u32, 0u32, 1u32, 2u32]);
+    let f = pkg::table!{ "k": [0.0, -0.0, f64::NAN, f64::NAN] };
+    assert(agg(f, ["k"], [count()]).nrows() == 2);
+}
+
+#[test]
+fn whole_table_and_empty() {
+    let t = pkg::table!{ "x": [1.0, 2.0, 6.0] };
+    let s = try t.agg([sum("x"), mean("x"), count()]) catch e { panic(f"{e}"); };
+    assert(s.nrows() == 1 && s.row(0).f64("x_mean") == 3.0);
+    let e = t.head(0);
+    let es = try e.agg([sum("x"), mean("x"), count()]) catch e2 { panic(f"{e2}"); };
+    assert(es.nrows() == 1 && es.row(0).i64("count") == 0 && es.row(0).f64("x_mean") is none);
+    let k = pkg::table!{ "g": ["a"], "x": [1.0] };
+    let ge = agg(k.head(0), ["g"], [sum("x")]);
+    assert(ge.shape() == (0, 2));
+}
+
+#[test]
+fn errors() {
+    let t = pkg::table!{ "g": ["a"], "s": ["x"] };
+    let m = try (try t.group_by(["g"])).agg([mean("s")]).nrows() as i64 catch e {
+        assert(e.message().contains("column `s` is str, but a number is needed"), e.message());
+        -1
+    };
+    assert(m == -1);
+    let q = try (try t.group_by(["g"])).agg([quantile("s", 2.0)]).nrows() as i64 catch _ { -1 };
+    assert(q == -1);
+    let k = try t.group_by(["gg"]).len() as i64 catch e {
+        assert(e.message().contains("did you mean `g`"));
+        -1
+    };
+    assert(k == -1);
+    let z = try t.group_by([]).len() as i64 catch _ { -1 };
+    assert(z == -1);
+}
+
+#[test]
+fn partitioned_matches_sequential() {
+    // Above the threshold the grouping is partitioned; the group order
+    // and every sum must equal a dictionary-built reference.
+    let n = 1200000;
+    let rng = Xoshiro256PlusPlus::seed(99u64);
+    let keys: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(5000u64) as i64);
+    let names: List<str> = List::from_fn(n, |i| if keys[i] % 3 == 0 { "x" } else { "y" });
+    let vals: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(100u64) as i64);
+    let t = try Table::from_columns([("k", Column::from(keys)), ("n", Column::from(names)), ("v", Column::from(vals))]) catch e { panic(f"{e}"); };
+    let r = agg(t, ["k", "n"], [sum("v"), count()]);
+    let order: List<i64> = List::new();
+    let sums: Dict<i64, i64> = Dict::new();
+    for i in 0..n {
+        let k = keys[i];
+        if !sums.contains_key(k) { order.push(k); }
+        _ = sums.insert(k, (sums.get(k) ?? 0) + vals[i]);
+    }
+    assert(r.nrows() == order.len());
+    let rk = try r.i64("k") catch _ { [0] };
+    let rs = try r.i64("v_sum") catch _ { [0] };
+    let a = rk.to_list();
+    let b = rs.to_list();
+    for g in 0..order.len() {
+        assert(a[g] == order[g]);
+        assert(b[g] == (sums.get(order[g]) ?? -1));
+    }
+    let dt = r.column_at(1).dtype();
+    assert(dt == DType::Str);
+}
+
+#[test]
+fn parallel_float_sums() {
+    // f64 sums above the threshold run on workers; compare with a
+    // per-group compensated sum done here.
+    let n = 1500000;
+    let rng = Xoshiro256PlusPlus::seed(4u64);
+    let keys: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(300u64) as i64);
+    let vals: List<f64> = List::from_fn(n, [ref rng] |_| rng.f64() * 2.0 - 1.0);
+    let t = try Table::from_columns([("k", Column::from(keys)), ("v", Column::from(vals))]) catch e { panic(f"{e}"); };
+    let r = agg(t, ["k"], [sum("v"), mean("v"), count()]);
+    let pos: Dict<i64, usize> = Dict::new();
+    let rk = (try r.i64("k") catch _ { [0] }).to_list();
+    for g in 0..rk.len() { _ = pos.insert(rk[g], g); }
+    let want: List<f64> = List::filled(rk.len(), 0.0);
+    let cnt: List<i64> = List::filled(rk.len(), 0);
+    for i in 0..n {
+        let g = pos.get(keys[i]) ?? 0;
+        want[g] += vals[i];
+        cnt[g] += 1;
+    }
+    let got = (try r.f64("v_sum") catch _ { [0.0] }).to_list();
+    let mean_got = (try r.f64("v_mean") catch _ { [0.0] }).to_list();
+    let cnt_got = (try r.i64("count") catch _ { [0] }).to_list();
+    for g in 0..rk.len() {
+        assert((got[g] - want[g]).abs() <= 1e-10 * want[g].abs().max(1.0), f"group {g}: {got[g]} vs {want[g]}");
+        assert(cnt_got[g] == cnt[g]);
+        assert((mean_got[g] - want[g] / cnt[g] as f64).abs() <= 1e-10 * mean_got[g].abs().max(1.0));
+    }
+}

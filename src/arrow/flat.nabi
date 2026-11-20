@@ -1,0 +1,271 @@
+// FlatBuffers, the encoding of Arrow's metadata, written and read by
+// hand. The writer lays a table's vtable just before it and its
+// children after it, so every uoffset points forward as the format
+// requires; the reader checks every position it follows.
+
+use pkg::TableError;
+use pkg::bytes::{bad, i32_at, need, pad, put_u16, put_u32, put_u64, set_u32, u16_at, u32_at, u64_at};
+
+const FMT: str = "arrow";
+
+/// A field value of a table being written.
+pub(pkg) enum Fv {
+    U8(u64),
+    I16(i64),
+    I32(i64),
+    I64(i64),
+    Str(str),
+    Table(List<Slot>),
+    Tables(List<List<Slot>>),
+    /// Packed structs: their bytes and how many there are.
+    Structs(List<u8>, usize),
+}
+
+/// Field `id` of a table.
+pub(pkg) struct Slot {
+    pub(pkg) id: usize;
+    pub(pkg) v: Fv;
+}
+
+pub(pkg) fn slot(id: usize, v: Fv) -> Slot { Slot { id, v } }
+
+fn width(v: Fv) -> usize {
+    match v {
+        Fv::U8(_) => 1,
+        Fv::I16(_) => 2,
+        Fv::I64(_) => 8,
+        _ => 4,
+    }
+}
+
+/// The buffer of root table `root`.
+pub(pkg) fn finish(root: List<Slot>) -> List<u8> {
+    let b: List<u8> = List::with_capacity(256);
+    put_u32(b, 0u64);
+    let t = table(b, root);
+    set_u32(b, 0, t as u64);
+    pad(b, 8);
+    b
+}
+
+fn table(b: List<u8>, slots: List<Slot>) -> usize {
+    let nf = 0usize;
+    let wide = false;
+    for s in slots {
+        nf = nf.max(s.id + 1);
+        if width(s.v) == 8 { wide = true; }
+    }
+    // Inline layout relative to the table start: the soffset, then the
+    // fields widest first so each is aligned.
+    let at: List<usize> = List::filled(slots.len(), 0);
+    let off = 4usize;
+    for w in [8usize, 4, 2, 1] {
+        for i in 0..slots.len() {
+            if width(slots[i].v) != w { continue; }
+            while off % w != 0 { off += 1; }
+            at[i] = off;
+            off += w;
+        }
+    }
+    let size = off;
+    let align = if wide { 8usize } else { 4usize };
+    pad(b, 2);
+    // The table must start aligned: pad before the vtable so the table
+    // follows it directly.
+    let vlen = 4 + 2 * nf;
+    while (b.len() + vlen) % align != 0 {
+        b.push(0u8);
+    }
+    let vt = b.len();
+    put_u16(b, vlen as u64);
+    put_u16(b, size as u64);
+    for f in 0..nf {
+        let o = 0usize;
+        for i in 0..slots.len() {
+            if slots[i].id == f { o = at[i]; }
+        }
+        put_u16(b, o as u64);
+    }
+    let t = b.len();
+    for _ in 0..size {
+        b.push(0u8);
+    }
+    set_u32(b, t, (t - vt) as u64);
+    for i in 0..slots.len() {
+        let p = t + at[i];
+        match slots[i].v {
+            Fv::U8(x) => b[p] = x as u8,
+            Fv::I16(x) => {
+                b[p] = x as u8;
+                b[p + 1] = ((x as u64) >> 8u64) as u8;
+            },
+            Fv::I32(x) => set_u32(b, p, (x as u64) & 0xFFFFFFFFu64),
+            Fv::I64(x) => {
+                set_u32(b, p, (x as u64) & 0xFFFFFFFFu64);
+                set_u32(b, p + 4, (x as u64) >> 32u64);
+            },
+            _ => {},
+        }
+    }
+    for i in 0..slots.len() {
+        let p = t + at[i];
+        let c = match slots[i].v {
+            Fv::Str(s) => {
+                pad(b, 4);
+                let c = b.len();
+                put_u32(b, s.len() as u64);
+                for x in s.as_bytes() {
+                    b.push(x);
+                }
+                b.push(0u8);
+                c
+            },
+            Fv::Table(kids) => table(b, kids),
+            Fv::Tables(ts) => {
+                pad(b, 4);
+                let c = b.len();
+                put_u32(b, ts.len() as u64);
+                let first = b.len();
+                for _ in 0..ts.len() {
+                    put_u32(b, 0u64);
+                }
+                for k in 0..ts.len() {
+                    let q = first + 4 * k;
+                    let e = table(b, ts[k]);
+                    set_u32(b, q, (e - q) as u64);
+                }
+                c
+            },
+            Fv::Structs(bytes, n) => {
+                while (b.len() + 4) % 8 != 0 {
+                    b.push(0u8);
+                }
+                let c = b.len();
+                put_u32(b, n as u64);
+                for x in bytes {
+                    b.push(x);
+                }
+                c
+            },
+            _ => continue,
+        };
+        set_u32(b, p, (c - p) as u64);
+    }
+    t
+}
+
+/// Packed structs of 64-bit fields, as the record batch's nodes and
+/// buffers and the footer's blocks are.
+pub(pkg) fn longs(xs: List<i64>) -> List<u8> {
+    let b: List<u8> = List::with_capacity(8 * xs.len());
+    for x in xs {
+        put_u64(b, x as u64);
+    }
+    b
+}
+
+// Reading. Positions are absolute in `b`; a buffer starts at `base`.
+
+/// The root table of the buffer at `base`.
+pub(pkg) fn root(b: List<u8>, base: usize) throws (TableError) -> usize {
+    try need(b, base, 4, FMT);
+    let t = base + u32_at(b, base) as usize;
+    try check_table(b, t);
+    t
+}
+
+fn check_table(b: List<u8>, t: usize) throws (TableError) {
+    try need(b, t, 4, FMT);
+    let vt = t as i64 - i32_at(b, t);
+    if vt < 0 { throw bad(FMT, f"a table at {t} points outside the data"); }
+    try need(b, vt as usize, 4, FMT);
+    let vlen = u16_at(b, vt as usize) as usize;
+    try need(b, vt as usize, vlen, FMT);
+    try need(b, t, u16_at(b, vt as usize + 2) as usize, FMT);
+}
+
+/// The position of field `id` of table `t`, `none` when absent.
+pub(pkg) fn field(b: List<u8>, t: usize, id: usize) -> usize | none {
+    let vt = (t as i64 - i32_at(b, t)) as usize;
+    let vlen = u16_at(b, vt) as usize;
+    if 4 + 2 * id + 2 > vlen { return none; }
+    let o = u16_at(b, vt + 4 + 2 * id) as usize;
+    if o == 0 { none } else { t + o }
+}
+
+pub(pkg) fn get_u8(b: List<u8>, t: usize, id: usize, default: u64) -> u64 {
+    match field(b, t, id) {
+        p: usize => b[p] as u64,
+        none => default,
+    }
+}
+
+pub(pkg) fn get_i16(b: List<u8>, t: usize, id: usize, default: i64) -> i64 {
+    match field(b, t, id) {
+        p: usize => (u16_at(b, p) as u16) as i16 as i64,
+        none => default,
+    }
+}
+
+pub(pkg) fn get_i32(b: List<u8>, t: usize, id: usize, default: i64) -> i64 {
+    match field(b, t, id) {
+        p: usize => i32_at(b, p),
+        none => default,
+    }
+}
+
+pub(pkg) fn get_i64(b: List<u8>, t: usize, id: usize, default: i64) -> i64 {
+    match field(b, t, id) {
+        p: usize => u64_at(b, p) as i64,
+        none => default,
+    }
+}
+
+fn deref(b: List<u8>, p: usize) throws (TableError) -> usize {
+    try need(b, p, 4, FMT);
+    p + u32_at(b, p) as usize
+}
+
+/// Field `id` of `t` as a table.
+pub(pkg) fn get_table(b: List<u8>, t: usize, id: usize) throws (TableError) -> usize | none {
+    let p = field(b, t, id);
+    if let q: usize = p {
+        let c = try deref(b, q);
+        try check_table(b, c);
+        return c;
+    }
+    none
+}
+
+/// Field `id` of `t` as a string.
+pub(pkg) fn get_str(b: List<u8>, t: usize, id: usize) throws (TableError) -> str | none {
+    let p = field(b, t, id);
+    if let q: usize = p {
+        let s = try deref(b, q);
+        try need(b, s, 4, FMT);
+        let n = u32_at(b, s) as usize;
+        return try pkg::bytes::text_at(b, s + 4, n, FMT);
+    }
+    none
+}
+
+/// Field `id` of `t` as a vector: the first element's position and the
+/// count, every element `size` bytes (4 for tables and strings).
+pub(pkg) fn get_vec(b: List<u8>, t: usize, id: usize, size: usize) throws (TableError) -> (usize, usize) {
+    let p = field(b, t, id);
+    if let q: usize = p {
+        let s = try deref(b, q);
+        try need(b, s, 4, FMT);
+        let n = u32_at(b, s) as usize;
+        try need(b, s + 4, n * size, FMT);
+        return (s + 4, n);
+    }
+    (0, 0)
+}
+
+/// Element `i` of a vector of tables starting at `first`.
+pub(pkg) fn vec_table(b: List<u8>, first: usize, i: usize) throws (TableError) -> usize {
+    let c = try deref(b, first + 4 * i);
+    try check_table(b, c);
+    c
+}

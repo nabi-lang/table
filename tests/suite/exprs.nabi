@@ -1,0 +1,198 @@
+// Expressions: arithmetic, comparison, logic, nulls, functions,
+// cumulative and rolling windows, indexing a table by name and mask.
+
+use pkg::{Column, DType, Table, TableError, Value, col, lit, when};
+use std::random::Rng;
+
+fn error_of<T>(f: fn() throws (TableError) -> T) -> str {
+    try f() catch e { return e.message(); };
+    ""
+}
+
+fn eval(t: Table, e: pkg::Expr) -> Column { try e.eval(t) catch err { panic(f"{err}"); } }
+
+#[test]
+fn arithmetic_types() {
+    let t = pkg::table!{ "i": [1, 2, 3], "f": [0.5, 1.5, 2.5] };
+    assert(eval(t, col("i") .+ 1).dtype() == DType::I64);
+    assert(eval(t, col("i") .* col("i")).to_options_i64() == [1, 4, 9]);
+    assert(eval(t, col("i") ./ 2).to_options_f64() == [0.5, 1.0, 1.5]);
+    assert(eval(t, col("i") .% 2).to_options_i64() == [1, 0, 1]);
+    assert(eval(t, col("i") .+ col("f")).to_options_f64() == [1.5, 3.5, 5.5]);
+    assert(eval(t, col("i") .** 2).to_options_f64() == [1.0, 4.0, 9.0]);
+    assert(eval(t, 10 .- col("i")).to_options_i64() == [9, 8, 7]);
+    assert(eval(t, 1.0 ./ col("f")).get(0) == Value::Float(2.0));
+    assert(eval(t, -col("i")).to_options_i64() == [-1, -2, -3]);
+    // A scalar-only expression fills every row.
+    assert(eval(t, lit(2) .* 3).to_options_i64() == [6, 6, 6]);
+    // Precedence follows `*` over `+`.
+    assert(eval(t, col("i") .+ col("i") .* 10).to_options_i64() == [11, 22, 33]);
+}
+
+#[test]
+fn division_by_zero() {
+    let t = pkg::table!{ "a": [1, 2], "b": [0, 1] };
+    let r = eval(t, col("a") .% col("b"));
+    assert(r.to_options_i64() == [none, 0]);
+    let d = eval(t, col("a") ./ col("b")).to_options_f64();
+    assert(d[0] == f64::INFINITY && d[1] == 2.0);
+}
+
+#[test]
+fn comparisons() {
+    let t = pkg::table!{ "x": [1, 5, 3], "s": ["a", "b", "a"], "d": [date"2024-01-01", date"2024-06-01", date"2023-01-01"] };
+    let b = eval(t, col("x") .>= 3);
+    assert(b.dtype() == DType::Bool);
+    assert(b.validity().len() == 3);
+    assert(eval(t, col("x") .> 2.5).values() == [Value::Bool(false), Value::Bool(true), Value::Bool(true)]);
+    assert(eval(t, col("s") .== "a").values() == [Value::Bool(true), Value::Bool(false), Value::Bool(true)]);
+    assert(eval(t, col("s") .< "b").values()[1] == Value::Bool(false));
+    assert(eval(t, col("d") .< date"2024-03-01").values() == [Value::Bool(true), Value::Bool(false), Value::Bool(true)]);
+    assert(eval(t, 3 .< col("x")).values()[1] == Value::Bool(true));
+    let c = try t.with("c", Column::cat(["a", "b", "a"])) catch _ { t };
+    assert(eval(c, col("c") .== "a").values() == [Value::Bool(true), Value::Bool(false), Value::Bool(true)]);
+    assert(eval(c, col("c") .!= "zz").values() == [Value::Bool(true), Value::Bool(true), Value::Bool(true)]);
+    assert(eval(c, col("c") .== col("s")).values() == [Value::Bool(true), Value::Bool(true), Value::Bool(true)]);
+    let m2 = error_of(|| try (col("s") .> 1).eval(t));
+    assert(m2.contains("compares str with i64"), m2);
+}
+
+#[test]
+fn three_valued_logic() {
+    let t = pkg::table!{ "p": [true, true, false, none, none, false], "q": [none, false, none, true, false, false] };
+    let and = eval(t, col("p") .&& col("q")).values();
+    assert(and == [Value::Null, Value::Bool(false), Value::Bool(false), Value::Null, Value::Bool(false), Value::Bool(false)]);
+    let or = eval(t, col("p") .|| col("q")).values();
+    assert(or == [Value::Bool(true), Value::Bool(true), Value::Null, Value::Bool(true), Value::Null, Value::Bool(false)]);
+    assert(eval(t, !col("q")).values()[1] == Value::Bool(true));
+    let f = try t.filter(col("p") .|| col("q")) catch e { panic(f"{e}"); };
+    assert(f.nrows() == 3);
+}
+
+#[test]
+fn null_propagation() {
+    let t = pkg::table!{ "x": [1.0, none, 3.0], "y": [none, 2.0, 4.0] };
+    assert(eval(t, col("x") .+ col("y")).to_options_f64() == [none, none, 7.0]);
+    assert(eval(t, col("x") .> 0).null_count() == 1);
+    assert(eval(t, col("x") .* lit(Value::Null)).null_count() == 3);
+    assert(eval(t, col("x").is_null()).values() == [Value::Bool(false), Value::Bool(true), Value::Bool(false)]);
+    assert(eval(t, col("x").fill_null(0.0)).to_options_f64() == [1.0, 0.0, 3.0]);
+    assert(eval(t, col("x").fill_null(col("y"))).to_options_f64() == [1.0, 2.0, 3.0]);
+    assert((try t.filter(col("x").is_not_null()) catch _ { t }).nrows() == 2);
+}
+
+#[test]
+fn functions() {
+    let t = pkg::table!{ "x": [-1.5, 4.0], "s": ["Ab", "cd"], "d": [datetime"2024-02-29T23:00:00", datetime"1969-12-31T12:00:00"] };
+    assert(eval(t, col("x").abs()).to_options_f64() == [1.5, 4.0]);
+    assert(eval(t, col("x").round()).to_options_f64() == [-2.0, 4.0]);
+    assert(eval(t, col("x").floor()).to_options_f64() == [-2.0, 4.0]);
+    assert(eval(t, col("x").sqrt()).get(1) == Value::Float(2.0));
+    assert(eval(t, col("s").upper()).to_options_str() == ["AB", "CD"]);
+    assert(eval(t, col("s").len()).to_options_i64() == [2, 2]);
+    assert(eval(t, col("s").starts_with("A")).values() == [Value::Bool(true), Value::Bool(false)]);
+    assert(eval(t, col("s").contains("d")).values() == [Value::Bool(false), Value::Bool(true)]);
+    assert(eval(t, col("d").year()).to_options_i64() == [2024, 1969]);
+    assert(eval(t, col("d").day()).to_options_i64() == [29, 31]);
+    assert(eval(t, col("d").weekday()).to_options_i64() == [3, 2]);
+    assert(eval(t, col("x").map_f64(|v| v * 10.0)).to_options_f64() == [-15.0, 40.0]);
+    assert(eval(t, col("s").map(|v| Value::Int((v.as_str() ?? "").len() as i64))).to_options_i64() == [2, 2]);
+    assert(eval(t, col("x").cast(DType::I64)).to_options_i64() == [-1, 4]);
+    assert(eval(t, col("s").is_in([Value::Str("cd")])).values() == [Value::Bool(false), Value::Bool(true)]);
+    let m = error_of(|| try col("s").year().eval(t));
+    assert(m.contains("needs a date"), m);
+}
+
+#[test]
+fn when_then_otherwise() {
+    let t = pkg::table!{ "x": [-2, 0, 3, none] };
+    let e = when(col("x") .> 0).then("pos").otherwise(when(col("x") .< 0).then("neg").otherwise("zero"));
+    assert(eval(t, e).to_options_str() == ["neg", "zero", "pos", "zero"]);
+    let n = eval(t, when(col("x") .> 0).then(col("x")).otherwise(0.5));
+    assert(n.dtype() == DType::F64 && n.to_options_f64() == [0.5, 0.5, 3.0, 0.5]);
+}
+
+#[test]
+fn cumulative() {
+    let t = pkg::table!{ "i": [1, none, 3, 2], "f": [1.0, 2.0, none, 0.5] };
+    assert(eval(t, col("i").cum_sum()).to_options_i64() == [1, none, 4, 6]);
+    assert(eval(t, col("i").cum_max()).to_options_i64() == [1, none, 3, 3]);
+    assert(eval(t, col("i").cum_min()).to_options_i64() == [1, none, 1, 1]);
+    assert(eval(t, col("i").cum_count()).to_options_i64() == [1, 1, 2, 3]);
+    assert(eval(t, col("f").cum_prod()).to_options_f64() == [1.0, 2.0, none, 1.0]);
+    // A long compensated sum of 0.1s stays exact to the last digit.
+    let n = 100000;
+    let big = try Table::from_columns([("x", Column::from(List::filled(n, 0.1)))]) catch _ { t };
+    let s = eval(big, col("x").cum_sum()).to_options_f64();
+    assert(((s[n - 1] ?? 0.0) - 10000.0).abs() < 1e-9);
+}
+
+#[test]
+fn rolling() {
+    let t = pkg::table!{ "x": [1.0, 2.0, 3.0, 4.0, 10.0, none, 6.0] };
+    assert(eval(t, col("x").rolling_sum(2)).to_options_f64() == [none, 3.0, 5.0, 7.0, 14.0, none, none]);
+    assert(eval(t, col("x").rolling_mean(3)).to_options_f64() == [none, none, 2.0, 3.0, 17.0 / 3.0, none, none]);
+    assert(eval(t, col("x").rolling_max(3)).to_options_f64() == [none, none, 3.0, 4.0, 10.0, none, none]);
+    assert(eval(t, col("x").rolling_min(2)).to_options_f64() == [none, 1.0, 2.0, 3.0, 4.0, none, none]);
+    let sd = eval(t, col("x").rolling_std(3)).to_options_f64();
+    assert(((sd[2] ?? 0.0) - 1.0).abs() < 1e-12);
+    // min_periods: start once one value is present, nulls skipped.
+    assert(eval(t, col("x").rolling("sum", 2, 1)).to_options_f64() == [1.0, 3.0, 5.0, 7.0, 14.0, 10.0, 6.0]);
+    assert(eval(t, col("x").rolling("max", 3, 1)).to_options_f64() == [1.0, 2.0, 3.0, 4.0, 10.0, 10.0, 10.0]);
+    let m = error_of(|| try col("x").rolling_sum(0).eval(t));
+    assert(m.contains("window >= 1"), m);
+    // Against a direct sum on random data.
+    let rng = std::random::Xoshiro256PlusPlus::seed(7u64);
+    let xs: List<f64> = List::from_fn(500, [ref rng] |_| rng.f64() * 100.0 - 50.0);
+    let r = try Table::from_columns([("x", Column::from(xs))]) catch _ { t };
+    let got = eval(r, col("x").rolling_mean(17)).to_options_f64();
+    let mins = eval(r, col("x").rolling_min(17)).to_options_f64();
+    for i in 16..500 {
+        let s = 0.0;
+        let lo = f64::INFINITY;
+        for j in i - 16..i + 1 {
+            s += xs[j];
+            lo = lo.min(xs[j]);
+        }
+        assert(((got[i] ?? 0.0) - s / 17.0).abs() < 1e-9);
+        assert(mins[i] == lo);
+    }
+}
+
+#[test]
+fn shift_and_diff() {
+    let t = pkg::table!{ "x": [1, 4, 9] };
+    assert(eval(t, col("x").shift(1)).to_options_i64() == [none, 1, 4]);
+    assert(eval(t, col("x").shift(-1)).to_options_i64() == [4, 9, none]);
+    assert(eval(t, col("x").diff(1)).to_options_i64() == [none, 3, 5]);
+}
+
+#[test]
+fn with_columns_and_display() {
+    let t = pkg::table!{ "x": [1.0, 2.0] };
+    let u = try t.with_columns([("a", col("x") .* 2), ("x", col("x") .+ 1)]) catch e { panic(f"{e}"); };
+    assert(u.names() == ["x", "a"]);
+    assert(u.row(1).f64("a") == 4.0 && u.row(1).f64("x") == 3.0);
+    assert(f"{col("x") .* 2 .+ col("y")}" == "((col(\"x\") .* 2) .+ col(\"y\"))");
+    assert((col("a") .+ col("b") .* col("a")).columns() == ["a", "b"]);
+    let m = error_of(|| try t.with_column("y", col("nope")));
+    assert(m.contains("no column `nope`"), m);
+}
+
+#[test]
+fn empty_table_exprs() {
+    let t = pkg::table!{ "x": [1.0] }.head(0);
+    assert(eval(t, col("x") .* 2).len() == 0);
+    assert((try t.filter(col("x") .> 0) catch _ { t }).nrows() == 0);
+    assert(eval(t, col("x").cum_sum()).len() == 0);
+    assert(eval(t, col("x").rolling_mean(3)).len() == 0);
+}
+
+#[test]
+fn indexing_sugar() {
+    let t = pkg::table!{ "x": [-1, 2, 3], "y": ["a", "b", "c"] };
+    assert(t["y"].get(2) == Value::Str("c"));
+    assert(t[["y", "x"]].names() == ["y", "x"]);
+    assert(t[col("x") .> 0].nrows() == 2);
+    assert(t[col("x") .> 0 .&& col("y") .!= "c"]["y"].to_options_str() == ["b"]);
+}

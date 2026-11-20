@@ -1,0 +1,85 @@
+// Running a plan: each step on its inputs' tables; a scan reads its
+// columns, applies its filters and keeps what the plan needs.
+
+use pkg::lazy::plan::{Plan, Source, Step};
+use pkg::{Arrow, Expr, Table, TableError};
+use std::fs;
+
+fn filter_all(t: Table, fs: List<Expr>) throws (TableError) -> Table {
+    let out = t;
+    for e in fs {
+        out = try out.filter(e);
+    }
+    out
+}
+
+fn finish(t: Table, s: Source) throws (TableError) -> Table {
+    let out = try filter_all(t, s.filters);
+    if let k: List<str> = s.keep {
+        if k != out.names() { out = try out.select(k); }
+    }
+    if out.nrows() > s.limit { out = out.head(s.limit); }
+    out
+}
+
+fn csv(s: Source) throws (TableError) -> Table {
+    let f = try fs::open(s.path) catch e { throw TableError::Io { msg: f"cannot read `{s.path}`: {e}" }; };
+    let r = s.csv.reader(f);
+    let parts: List<Table> = List::new();
+    let rows = 0usize;
+    loop {
+        let b = try r.next();
+        let t = b ?? break;
+        if let c: List<str> = s.cols { t = try t.select(c); }
+        let part = try finish(t, s);
+        rows += part.nrows();
+        parts.push(part);
+        if rows >= s.limit { break; }
+    }
+    if parts.is_empty() {
+        // No rows: the header's columns, typed `str`.
+        let names = s.keep ?? s.cols ?? r.names();
+        let cols: List<(str, pkg::Column)> = names.iter().map(|n| (n, pkg::Column::strs(List::new()))).collect();
+        return try Table::from_columns(cols);
+    }
+    let t = try Table::concat(parts);
+    if t.nrows() > s.limit { t.head(s.limit) } else { t }
+}
+
+fn scan(s: Source) throws (TableError) -> Table {
+    match s.kind {
+        "parquet" => {
+            let o = s.pq.clone();
+            o.bounds = s.bounds;
+            if s.filters.is_empty() { o.limit = s.limit; }
+            let t = match s.cols {
+                c: List<str> => try o.columns(c).read_bytes(try s.bytes()),
+                none => try o.read_bytes(try s.bytes()),
+            };
+            try finish(t, s)
+        },
+        "arrow" => {
+            let a: Arrow = match s.cols {
+                c: List<str> => s.ar.columns(c),
+                none => s.ar,
+            };
+            try finish(try a.read_bytes(try s.bytes()), s)
+        },
+        _ => try csv(s),
+    }
+}
+
+/// The table `p` gives.
+pub(pkg) fn exec(p: Plan) throws (TableError) -> Table {
+    match p.step {
+        Step::Frame(t) => t,
+        Step::Scan(s) => try scan(s),
+        Step::Select(ns) => try (try exec(p.kids[0])).select(ns),
+        Step::Filter(e) => try (try exec(p.kids[0])).filter(e),
+        Step::With(es) => try (try exec(p.kids[0])).with_columns(es),
+        Step::Agg(keys, aggs) => try (try (try exec(p.kids[0])).group_by(keys)).agg(aggs),
+        Step::Sort(ks) => try (try exec(p.kids[0])).sort(ks),
+        Step::Join(lo, ro, how) => try (try exec(p.kids[0])).join_on(try exec(p.kids[1]), lo, ro, how),
+        Step::Limit(n) => (try exec(p.kids[0])).head(n),
+    }
+}

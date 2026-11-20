@@ -1,0 +1,588 @@
+// The Parquet reader: the footer's FileMetaData, the flat columns of
+// the schema, then each kept column chunk page by page (dictionary
+// pages, data pages v1 and v2) into one accumulator per column across
+// the row groups. Row groups whose statistics rule out every `Bound`
+// are skipped unread.
+
+use pkg::bytes::{bad, f32_at, f64_at, i32_at, i64_at, need, text_at, u16_at, u32_at, u64_at};
+use pkg::column::Data;
+use pkg::column::bitmap::Bitmap;
+use pkg::parquet::Bound;
+use pkg::parquet::rle::{delta, hybrid};
+use pkg::parquet::thrift::{Cur, Tf, Tv, as_struct, bin, boolean, get, list, num, read_struct, sub, text};
+use pkg::{Column, DType, Field, Schema, Table, TableError, Value};
+use core::encoding::base64;
+
+const FMT: str = "parquet";
+
+fn fail(msg: str) -> TableError { bad(FMT, msg) }
+
+/// A leaf column of the schema.
+pub(pkg) struct Leaf {
+    pub(pkg) name: str;
+    ptype: i64;
+    tlen: i64;
+    conv: i64;
+    logical: List<Tf> | none;
+    max_def: i64;
+    /// Why it cannot be read, "" when it can.
+    why: str;
+    pub(pkg) dtype: DType;
+}
+
+/// The file's metadata: the leaves, the row groups and the row count.
+pub(pkg) struct Meta {
+    pub(pkg) leaves: List<Leaf>;
+    groups: List<Tv>;
+    pub(pkg) rows: i64;
+}
+
+pub(pkg) fn meta(b: List<u8>) throws (TableError) -> Meta {
+    let n = b.len();
+    if n < 12 || !magic(b, 0) || !magic(b, n - 4) { throw fail("not a Parquet file (no PAR1 at both ends)"); }
+    let len = u32_at(b, n - 8) as usize;
+    if len + 12 > n { throw fail("the footer length is wrong; the file may be cut short"); }
+    let c = Cur { b, p: n - 8 - len, e: n - 8 };
+    let fm = try read_struct(ref c);
+    let schema = list(fm, 2);
+    let cats = arrow_cats(fm);
+    let leaves: List<Leaf> = List::new();
+    if schema.is_empty() { throw fail("the file has no schema"); }
+    let i = 1usize;
+    let top = num(as_struct(schema[0]), 5, 0);
+    for _ in 0..top {
+        i = try walk(schema, i, "", 0, false, leaves, cats);
+    }
+    Meta { leaves, groups: list(fm, 4), rows: num(fm, 3, 0) }
+}
+
+fn magic(b: List<u8>, p: usize) -> bool { b[p] == 80u8 && b[p + 1] == 65u8 && b[p + 2] == 82u8 && b[p + 3] == 49u8 }
+
+/// The names the `ARROW:schema` metadata gives a dictionary type.
+fn arrow_cats(fm: List<Tf>) -> List<str> {
+    let out: List<str> = List::new();
+    for kv in list(fm, 5) {
+        let s = as_struct(kv);
+        if text(s, 1) != "ARROW:schema" { continue; }
+        let raw = try base64::decode(text(s, 2)) catch _ { return out; };
+        let fs = try pkg::arrow::read::message_fields(raw) catch _ { return out; };
+        for f in fs {
+            if f.dict >= 0 { out.push(f.name); }
+        }
+    }
+    out
+}
+
+/// Add the leaves under schema element `i` (a top-level column `top`
+/// once inside a group); gives the next element.
+fn walk(schema: List<Tv>, i: usize, top: str, def: i64, nested: bool, leaves: List<Leaf>, cats: List<str>) throws (TableError) -> usize {
+    if i >= schema.len() { throw fail("the schema lists fewer elements than its groups say"); }
+    let e = as_struct(schema[i]);
+    let name = text(e, 4);
+    let rep = num(e, 3, 0);
+    let d = def + if rep > 0 { 1 } else { 0 };
+    let kids = num(e, 5, 0);
+    let owner = if top == "" { name } else { top };
+    if kids > 0 {
+        let j = i + 1;
+        for _ in 0..kids {
+            j = try walk(schema, j, owner, d, true, leaves, cats);
+        }
+        return j;
+    }
+    let leaf = Leaf { name: owner, ptype: num(e, 1, -1), tlen: num(e, 2, 0), conv: num(e, 6, -1), logical: sub(e, 10), max_def: d, why: "", dtype: DType::F64 };
+    if nested || rep == 2 {
+        leaf.why = "a nested (list, map or struct) column";
+    } else {
+        leaf.why = classify(leaf);
+        if leaf.why == "" { leaf.dtype = target(leaf, cats.contains(owner)); }
+    }
+    leaves.push(leaf);
+    i + 1
+}
+
+fn logical_kind(l: Leaf) -> i64 {
+    match l.logical {
+        s: List<Tf> => if s.is_empty() { -1 } else { s[0].id },
+        none => -1,
+    }
+}
+
+/// Why `l` cannot be read; "" when it can.
+fn classify(l: Leaf) -> str {
+    let lk = logical_kind(l);
+    if lk == 5 || l.conv == 5 { return "decimal"; }
+    if lk == 7 || l.conv == 7 || l.conv == 8 { return "time of day"; }
+    if l.conv == 21 { return "interval"; }
+    match l.ptype {
+        0 | 1 | 2 | 3 | 4 | 5 | 6 => "",
+        7 => if lk == 15 && l.tlen == 2 { "" } else { "fixed-length binary" },
+        _ => "of an unknown physical type",
+    }
+}
+
+fn target(l: Leaf, cat: bool) -> DType {
+    let lk = logical_kind(l);
+    match l.ptype {
+        0 => DType::Bool,
+        1 => if lk == 6 || l.conv == 6 { DType::Date } else { DType::I64 },
+        2 => if lk == 8 || l.conv == 9 || l.conv == 10 { DType::DateTime } else { DType::I64 },
+        3 => DType::DateTime,
+        6 => if cat { DType::Cat } else { DType::Str },
+        _ => DType::F64,
+    }
+}
+
+/// Nanoseconds per unit of an INT64 timestamp column.
+fn ns_per(l: Leaf) -> i64 {
+    if l.conv == 9 { return 1000000; }
+    if l.conv == 10 { return 1000; }
+    if let s: List<Tf> = l.logical {
+        if let ts: List<Tf> = sub(s, 8) {
+            if let u: List<Tf> = sub(ts, 2) {
+                if u.is_empty() { return 1; }
+                return match u[0].id {
+                    1 => 1000000,
+                    2 => 1000,
+                    _ => 1,
+                };
+            }
+        }
+    }
+    1
+}
+
+fn unsigned(l: Leaf) -> bool {
+    if l.conv >= 11 && l.conv <= 14 { return true; }
+    if let s: List<Tf> = l.logical {
+        if let it: List<Tf> = sub(s, 10) { return !boolean(it, 2, true); }
+    }
+    false
+}
+
+/// Values of one page or dictionary, in the physical type's family.
+enum Vals {
+    I(List<i64>),
+    F(List<f64>),
+    Bo(List<bool>),
+    S(List<str>),
+}
+
+fn plain(b: List<u8>, s: usize, e: usize, l: Leaf, n: usize) throws (TableError) -> Vals {
+    let short = || -> TableError { fail(f"column `{l.name}`: a page holds fewer values than its header says") };
+    match l.ptype {
+        0 => {
+            if (e - s) * 8 < n { throw short(); }
+            Vals::Bo(List::from_fn(n, |i| (b[s + (i >> 3)] >> (i & 7) as u8) & 1u8 == 1u8))
+        },
+        1 => {
+            if e - s < 4 * n { throw short(); }
+            if unsigned(l) {
+                Vals::I(List::from_fn(n, |i| u32_at(b, s + 4 * i) as i64))
+            } else {
+                Vals::I(List::from_fn(n, |i| i32_at(b, s + 4 * i)))
+            }
+        },
+        2 => {
+            if e - s < 8 * n { throw short(); }
+            let xs = List::from_fn(n, |i| i64_at(b, s + 8 * i));
+            if unsigned(l) {
+                for x in xs {
+                    if x < 0 { throw fail(f"column `{l.name}`: a uint64 value does not fit in i64"); }
+                }
+            }
+            Vals::I(xs)
+        },
+        3 => {
+            if e - s < 12 * n { throw short(); }
+            Vals::I(List::from_fn(n, |i| {
+                let nanos = u64_at(b, s + 12 * i) as i64;
+                let day = u32_at(b, s + 12 * i + 8) as i64;
+                (day - 2440588) * 86400000000000 + nanos
+            }))
+        },
+        4 => {
+            if e - s < 4 * n { throw short(); }
+            Vals::F(List::from_fn(n, |i| f32_at(b, s + 4 * i)))
+        },
+        5 => {
+            if e - s < 8 * n { throw short(); }
+            Vals::F(List::from_fn(n, |i| f64_at(b, s + 8 * i)))
+        },
+        6 => {
+            let out: List<str> = List::with_capacity(n);
+            let p = s;
+            for _ in 0..n {
+                if p + 4 > e { throw short(); }
+                let k = u32_at(b, p) as usize;
+                p += 4;
+                if k > e - p { throw short(); }
+                out.push(try text_at(b, p, k, FMT));
+                p += k;
+            }
+            Vals::S(out)
+        },
+        _ => {
+            if e - s < 2 * n { throw short(); }
+            Vals::F(List::from_fn(n, |i| half(u16_at(b, s + 2 * i))))
+        },
+    }
+}
+
+fn half(h: u64) -> f64 {
+    let sign = if h & 0x8000u64 != 0u64 { -1.0 } else { 1.0 };
+    let e = ((h >> 10u64) & 31u64) as i32;
+    let m = (h & 1023u64) as f64;
+    if e == 0 { return sign * m * 5.960464477539063e-8; }
+    if e == 31 { return if m == 0.0 { sign * f64::INFINITY } else { f64::NAN }; }
+    sign * (1.0 + m / 1024.0) * 2.0.powi(e - 15)
+}
+
+fn take(d: Vals, idx: List<u32>, name: str) throws (TableError) -> Vals {
+    let n = match d {
+        Vals::I(x) => x.len(),
+        Vals::F(x) => x.len(),
+        Vals::Bo(x) => x.len(),
+        Vals::S(x) => x.len(),
+    };
+    for k in idx {
+        if k as usize >= n { throw fail(f"column `{name}`: a dictionary index is out of range"); }
+    }
+    match d {
+        Vals::I(x) => Vals::I(List::from_fn(idx.len(), |i| x[idx[i] as usize])),
+        Vals::F(x) => Vals::F(List::from_fn(idx.len(), |i| x[idx[i] as usize])),
+        Vals::Bo(x) => Vals::Bo(List::from_fn(idx.len(), |i| x[idx[i] as usize])),
+        Vals::S(x) => Vals::S(List::from_fn(idx.len(), |i| x[idx[i] as usize])),
+    }
+}
+
+/// The values of a data page in encoding `enc` at `b[s..e]`.
+fn values(b: List<u8>, s: usize, e: usize, enc: i64, l: Leaf, n: usize, dict: Vals | none) throws (TableError) -> Vals {
+    match enc {
+        0 => try plain(b, s, e, l, n),
+        2 | 8 => {
+            let d = dict ?? throw fail(f"column `{l.name}`: a dictionary-encoded page without a dictionary page");
+            if n == 0 { return try take(d, List::new(), l.name); }
+            if s >= e { throw fail(f"column `{l.name}`: a dictionary page is empty"); }
+            let w = b[s] as usize;
+            try take(d, try hybrid(b, s + 1, e, w, n), l.name)
+        },
+        3 => {
+            // RLE booleans, after a four-byte length.
+            if l.ptype != 0 || s + 4 > e { throw fail(f"column `{l.name}`: RLE values on a non-boolean column"); }
+            let xs = try hybrid(b, s + 4, e, 1, n);
+            Vals::Bo(List::from_fn(n, |i| xs[i] == 1u32))
+        },
+        5 => {
+            let (xs, _) = try delta(b, s, e);
+            if xs.len() < n { throw fail(f"column `{l.name}`: a delta page holds too few values"); }
+            if l.ptype == 1 && unsigned(l) {
+                Vals::I(List::from_fn(n, |i| (xs[i] as u64 & 0xFFFFFFFFu64) as i64))
+            } else if l.ptype == 1 {
+                Vals::I(List::from_fn(n, |i| (xs[i] as u64 as u32) as i32 as i64))
+            } else {
+                Vals::I(xs)
+            }
+        },
+        6 => {
+            let (lens, p) = try delta(b, s, e);
+            let out: List<str> = List::with_capacity(n);
+            let q = p;
+            for i in 0..n {
+                let k = lens[i];
+                if k < 0 || k as usize > e - q { throw fail(f"column `{l.name}`: string lengths run past the page"); }
+                out.push(try text_at(b, q, k as usize, FMT));
+                q += k as usize;
+            }
+            Vals::S(out)
+        },
+        7 => {
+            let (pre, p) = try delta(b, s, e);
+            let (suf, q0) = try delta(b, p, e);
+            let out: List<str> = List::with_capacity(n);
+            let q = q0;
+            let prev: List<u8> = List::new();
+            for i in 0..n {
+                let a = pre[i];
+                let k = suf[i];
+                if a < 0 || a as usize > prev.len() || k < 0 || k as usize > e - q { throw fail(f"column `{l.name}`: a prefix or suffix runs past the page"); }
+                let cur = prev[0:a as usize].to_list();
+                for j in q..q + k as usize {
+                    cur.push(b[j]);
+                }
+                q += k as usize;
+                out.push(try str::from_utf8(cur) catch _ { throw fail(f"column `{l.name}`: a string is not UTF-8"); });
+                prev = cur;
+            }
+            Vals::S(out)
+        },
+        9 => {
+            let w = if l.ptype == 4 || l.ptype == 1 { 4usize } else { 8usize };
+            if e - s < w * n || l.ptype > 5 { throw fail(f"column `{l.name}`: a byte-stream-split page is cut short"); }
+            let raw: List<u8> = List::filled(w * n, 0u8);
+            for i in 0..n {
+                for k in 0..w {
+                    raw[w * i + k] = b[s + k * n + i];
+                }
+            }
+            try plain(raw, 0, raw.len(), l, n)
+        },
+        _ => throw fail(f"column `{l.name}`: encoding {enc} is not read here"),
+    }
+}
+
+/// A column being read: values in the physical family and validity.
+struct Acc {
+    i: List<i64>;
+    f: List<f64>;
+    bo: List<bool>;
+    s: List<str>;
+    valid: List<bool>;
+}
+
+fn push(a: Acc, v: Vals, defs: List<u32> | none, max: u32, n: usize) throws (TableError) {
+    let k = 0usize;
+    let present = match v {
+        Vals::I(x) => x.len(),
+        Vals::F(x) => x.len(),
+        Vals::Bo(x) => x.len(),
+        Vals::S(x) => x.len(),
+    };
+    for r in 0..n {
+        let ok = match defs {
+            d: List<u32> => d[r] == max,
+            none => true,
+        };
+        if ok && k >= present { throw fail("a page has fewer values than its levels say"); }
+        a.valid.push(ok);
+        match v {
+            Vals::I(x) => a.i.push(if ok { x[k] } else { 0 }),
+            Vals::F(x) => a.f.push(if ok { x[k] } else { 0.0 }),
+            Vals::Bo(x) => a.bo.push(if ok { x[k] } else { false }),
+            Vals::S(x) => a.s.push(if ok { x[k] } else { "" }),
+        }
+        if ok { k += 1; }
+    }
+}
+
+fn decompress(b: List<u8>, s: usize, e: usize, codec: i64, size: usize) throws (TableError) -> List<u8> {
+    let out = match codec {
+        0 => b[s:e].to_list(),
+        1 => try pkg::codec::snappy::decompress(b, s, e),
+        6 => try pkg::codec::zstd::decompress(b, s, e),
+        2 => throw fail("gzip compression is not read here; write the file with snappy, zstd or none"),
+        4 => throw fail("brotli compression is not read here; write the file with snappy, zstd or none"),
+        3 | 5 | 7 => throw fail("LZ4 compression is not read here; write the file with snappy, zstd or none"),
+        _ => throw fail(f"compression codec {codec} is unknown"),
+    };
+    if out.len() != size { throw fail(f"a page decompressed to {out.len()} bytes, not {size}"); }
+    out
+}
+
+/// Read column chunk `cc` of leaf `l` into `a`.
+fn chunk(b: List<u8>, cc: List<Tf>, l: Leaf, a: Acc) throws (TableError) {
+    let md = sub(cc, 3) ?? throw fail(f"column `{l.name}`: a column chunk without metadata (an external file) is not read here");
+    let codec = num(md, 4, 0);
+    let total = num(md, 5, 0);
+    let start = num(md, 9, 0);
+    let dp = num(md, 11, 0);
+    if dp > 0 && dp < start { start = dp; }
+    let size = num(md, 7, 0);
+    if start < 4 || size < 0 || (start + size) as usize > b.len() { throw fail(f"column `{l.name}`: the chunk lies outside the file"); }
+    let end = (start + size) as usize;
+    let p = start as usize;
+    let dict: Vals | none = none;
+    let seen = 0i64;
+    let max = l.max_def as u32;
+    while seen < total && p < end {
+        let c = Cur { b, p, e: end };
+        let h = try read_struct(ref c);
+        p = c.p;
+        let kind = num(h, 1, -1);
+        let raw = num(h, 2, -1);
+        let comp = num(h, 3, -1);
+        if raw < 0 || comp < 0 || p + comp as usize > end { throw fail(f"column `{l.name}`: a page lies outside its chunk"); }
+        let pe = p + comp as usize;
+        if kind == 2 {
+            let dh = sub(h, 7) ?? throw fail("a dictionary page without its header");
+            let page = try decompress(b, p, pe, codec, raw as usize);
+            dict = try plain(page, 0, page.len(), l, num(dh, 1, 0) as usize);
+        } else if kind == 0 {
+            let dh = sub(h, 5) ?? throw fail("a data page without its header");
+            let n = num(dh, 1, 0) as usize;
+            let page = try decompress(b, p, pe, codec, raw as usize);
+            let q = 0usize;
+            let defs: List<u32> | none = none;
+            if max > 0u32 {
+                if num(dh, 3, 3) != 3 { throw fail(f"column `{l.name}`: definition levels not in the RLE encoding"); }
+                try need(page, 0, 4, FMT);
+                let k = u32_at(page, 0) as usize;
+                try need(page, 4, k, FMT);
+                defs = try hybrid(page, 4, 4 + k, 1, n);
+                q = 4 + k;
+            }
+            let present = count(defs, max, n);
+            let v = try values(page, q, page.len(), num(dh, 2, 0), l, present, dict);
+            try push(a, v, defs, max, n);
+            seen += n as i64;
+        } else if kind == 3 {
+            let dh = sub(h, 8) ?? throw fail("a data page v2 without its header");
+            let n = num(dh, 1, 0) as usize;
+            let dl = num(dh, 5, 0) as usize;
+            let rl = num(dh, 6, 0) as usize;
+            if p + rl + dl > pe { throw fail(f"column `{l.name}`: levels run past their page"); }
+            let defs: List<u32> | none = none;
+            if max > 0u32 { defs = try hybrid(b, p + rl, p + rl + dl, 1, n); }
+            let vs = p + rl + dl;
+            let page = if boolean(dh, 7, true) && codec != 0 {
+                try decompress(b, vs, pe, codec, raw as usize - rl - dl)
+            } else {
+                b[vs:pe].to_list()
+            };
+            let present = count(defs, max, n);
+            let v = try values(page, 0, page.len(), num(dh, 4, 0), l, present, dict);
+            try push(a, v, defs, max, n);
+            seen += n as i64;
+        }
+        p = pe;
+    }
+    if seen != total { throw fail(f"column `{l.name}`: the pages hold {seen} values, not {total}"); }
+}
+
+fn count(defs: List<u32> | none, max: u32, n: usize) -> usize {
+    match defs {
+        d: List<u32> => {
+            let k = 0usize;
+            for x in d {
+                if x == max { k += 1; }
+            }
+            k
+        },
+        none => n,
+    }
+}
+
+fn finish(a: Acc, l: Leaf) throws (TableError) -> Column {
+    let data = match l.dtype {
+        DType::Bool => Data::Bool(a.bo),
+        DType::F64 => Data::F64(a.f),
+        DType::I64 => Data::I64(a.i),
+        DType::Date => Data::Date(List::from_fn(a.i.len(), |k| a.i[k] as i32)),
+        DType::DateTime => {
+            let m = if l.ptype == 2 { ns_per(l) } else { 1 };
+            if m > 1 {
+                for k in 0..a.i.len() {
+                    let x = a.i[k];
+                    if x > i64::MAX / m || x < i64::MIN / m { throw fail(f"column `{l.name}`: a timestamp is out of the nanosecond range"); }
+                    a.i[k] = x * m;
+                }
+            }
+            Data::DateTime(a.i)
+        },
+        _ => Data::Str(a.s),
+    };
+    let c = Column::with_valid(data, Bitmap::from_flags(a.valid));
+    if l.dtype == DType::Cat { c = c.to_cat(); }
+    c
+}
+
+/// A column statistic as a value of the column's type.
+fn stat(l: Leaf, x: List<u8>) -> Value {
+    match l.ptype {
+        1 => if x.len() == 4 {
+            let v = if unsigned(l) { u32_at(x, 0) as i64 } else { i32_at(x, 0) };
+            if l.dtype == DType::Date { Value::Date(pkg::Date { days: v as i32 }) } else { Value::Int(v) }
+        } else { Value::Null },
+        2 => if x.len() == 8 {
+            let v = i64_at(x, 0);
+            if l.dtype == DType::DateTime {
+                let m = ns_per(l);
+                if v > i64::MAX / m || v < i64::MIN / m { Value::Null } else { Value::DateTime(pkg::DateTime { ns: v * m }) }
+            } else if unsigned(l) && v < 0 { Value::Null } else { Value::Int(v) }
+        } else { Value::Null },
+        4 => if x.len() == 4 { Value::Float(f32_at(x, 0)) } else { Value::Null },
+        5 => if x.len() == 8 { Value::Float(f64_at(x, 0)) } else { Value::Null },
+        6 => {
+            let t = try? str::from_utf8(x);
+            match t {
+                s: str => Value::Str(s),
+                none => Value::Null,
+            }
+        },
+        _ => Value::Null,
+    }
+}
+
+/// Whether row group `rg` may hold rows meeting every bound.
+fn may_match(rg: List<Tf>, leaves: List<Leaf>, bounds: List<Bound>) -> bool {
+    let cols = list(rg, 1);
+    let rows = num(rg, 3, 0);
+    for bd in bounds {
+        for k in 0..leaves.len().min(cols.len()) {
+            let l = leaves[k];
+            if l.name != bd.col || l.why != "" { continue; }
+            let md = sub(as_struct(cols[k]), 3) ?? continue;
+            let st = sub(md, 12) ?? continue;
+            if num(st, 3, -1) == rows && rows > 0 { return false; }
+            // Only min_value / max_value: the old min / max of byte
+            // arrays used a signed order.
+            let lo = stat(l, bin(st, 6) ?? continue);
+            let hi = stat(l, bin(st, 5) ?? continue);
+            if lo is Value::Null || hi is Value::Null { continue; }
+            if !bd.may(lo, hi) { return false; }
+        }
+    }
+    true
+}
+
+/// The table's schema without reading its rows: unreadable columns are
+/// left out.
+pub(pkg) fn schema(b: List<u8>) throws (TableError) -> Schema {
+    let m = try meta(b);
+    let out: List<Field> = List::new();
+    for l in m.leaves {
+        if l.why == "" && !out.iter().any(|f| f.name == l.name) { out.push(Field { name: l.name, dtype: l.dtype }); }
+    }
+    Schema { fields: out }
+}
+
+/// The columns `cols` (every column when `none`) of the row groups that
+/// may meet `bounds`, stopping once `limit` rows are read.
+pub(pkg) fn read(b: List<u8>, cols: List<str> | none, bounds: List<Bound>, limit: usize) throws (TableError) -> Table {
+    let m = try meta(b);
+    let keep: List<usize> = List::new();
+    match cols {
+        names: List<str> => for nm in names {
+            let k = m.leaves.iter().position(|l| l.name == nm);
+            match k {
+                i: usize => keep.push(i),
+                none => throw TableError::missing(nm, m.leaves.iter().map(|l| l.name).collect()),
+            }
+        },
+        none => for i in 0..m.leaves.len() { keep.push(i); },
+    }
+    for k in keep {
+        let l = m.leaves[k];
+        if l.why != "" { throw fail(f"column `{l.name}` is {l.why}, which this package does not read; leave it out with `Parquet::columns`, or write it as a flat int, float, bool, string, date or timestamp column"); }
+    }
+    let accs: List<Acc> = List::from_fn(keep.len(), |_| Acc { i: List::new(), f: List::new(), bo: List::new(), s: List::new(), valid: List::new() });
+    let rows = 0usize;
+    for g in m.groups {
+        if rows >= limit { break; }
+        let rg = as_struct(g);
+        if !bounds.is_empty() && !may_match(rg, m.leaves, bounds) { continue; }
+        let cs = list(rg, 1);
+        if cs.len() != m.leaves.len() { throw fail("a row group has another number of columns than the schema"); }
+        for j in 0..keep.len() {
+            try chunk(b, as_struct(cs[keep[j]]), m.leaves[keep[j]], accs[j]);
+        }
+        rows += num(rg, 3, 0) as usize;
+    }
+    let t = Table::new();
+    for j in 0..keep.len() {
+        t = try t.set_column(m.leaves[keep[j]].name, try finish(accs[j], m.leaves[keep[j]]), false);
+    }
+    if keep.is_empty() { t.rows = rows; }
+    let _ = get;
+    t
+}

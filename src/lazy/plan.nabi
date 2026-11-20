@@ -1,0 +1,475 @@
+// The plan of a lazy query and its optimizer: filters split into
+// conjuncts and pushed toward the sources (never across a limit, a
+// window function or into the side of a join that would change which
+// rows survive), then the columns each step needs pushed down so
+// scans read only those, then a limit over a bare scan given to it.
+
+use pkg::expr::{Node, Op};
+use pkg::parquet::Bound;
+use pkg::{Agg, Arrow, Csv, Expr, How, Parquet, SortKey, Table, TableError, Value};
+use std::fs;
+
+/// One step; its inputs are the plan's `kids`.
+#[derive(Clone)]
+pub(pkg) enum Step {
+    Frame(Table),
+    Scan(Source),
+    Select(List<str>),
+    Filter(Expr),
+    With(List<(str, Expr)>),
+    Agg(List<str>, List<Agg>),
+    Sort(List<SortKey>),
+    Join(List<str>, List<str>, How),
+    Limit(usize),
+}
+
+#[derive(Clone)]
+pub(pkg) struct Plan {
+    pub(pkg) step: Step;
+    pub(pkg) kids: List<Plan>;
+}
+
+/// A file to scan, with what the optimizer gave it: the columns to
+/// read, the columns to keep after its filters, the filters, the
+/// bounds row groups are tested against, and a row limit.
+#[derive(Clone)]
+pub(pkg) struct Source {
+    pub(pkg) kind: str;
+    pub(pkg) path: str;
+    pub(pkg) csv: Csv;
+    pub(pkg) pq: Parquet;
+    pub(pkg) ar: Arrow;
+    pub(pkg) cols: List<str> | none;
+    pub(pkg) keep: List<str> | none;
+    pub(pkg) filters: List<Expr>;
+    pub(pkg) bounds: List<Bound>;
+    pub(pkg) limit: usize;
+    /// The file's bytes once read (Parquet and Arrow), shared by the
+    /// optimizer's schema look-ups and the run.
+    pub(pkg) cache: List<List<u8>>;
+}
+
+impl Source {
+    fn new(kind: str, path: str) -> Source {
+        Source { kind, path, csv: Csv::new(), pq: Parquet::new(), ar: Arrow::new(), cols: none, keep: none, filters: List::new(), bounds: List::new(), limit: usize::MAX, cache: List::new() }
+    }
+
+    pub(pkg) fn parquet(path: str, o: Parquet) -> Source {
+        let s = Source::new("parquet", path);
+        s.pq = o;
+        s
+    }
+
+    pub(pkg) fn arrow(path: str, o: Arrow) -> Source {
+        let s = Source::new("arrow", path);
+        s.ar = o;
+        s
+    }
+
+    pub(pkg) fn csv(path: str, o: Csv) -> Source {
+        let s = Source::new("csv", path);
+        s.csv = o;
+        s
+    }
+
+    pub(pkg) fn bytes(self) throws (TableError) -> List<u8> {
+        if self.cache.is_empty() { self.cache.push(try pkg::arrow::load(self.path)); }
+        self.cache[0]
+    }
+
+    /// The file's column names.
+    fn file_names(self) throws (TableError) -> List<str> {
+        match self.kind {
+            "parquet" => (try pkg::parquet_schema(try self.bytes())).names(),
+            "arrow" => (try pkg::arrow_schema(try self.bytes())).names(),
+            _ => {
+                let f = try fs::open(self.path) catch e { throw TableError::Io { msg: f"cannot read `{self.path}`: {e}" }; };
+                let r = self.csv.batch_rows(1).reader(f);
+                let _ = try r.next();
+                r.names()
+            },
+        }
+    }
+}
+
+fn leaf(s: Step) -> Plan { Plan { step: s, kids: List::new() } }
+
+fn over(s: Step, kid: Plan) -> Plan { Plan { step: s, kids: [kid] } }
+
+/// The output column names of `p`.
+pub(pkg) fn names(p: Plan) throws (TableError) -> List<str> {
+    match p.step {
+        Step::Frame(t) => t.names(),
+        Step::Scan(s) => s.keep ?? s.cols ?? try s.file_names(),
+        Step::Select(ns) => ns,
+        Step::Filter(_) | Step::Sort(_) | Step::Limit(_) => try names(p.kids[0]),
+        Step::With(es) => {
+            let out = try names(p.kids[0]);
+            for (n, _) in es {
+                if !out.contains(n) { out.push(n); }
+            }
+            out
+        },
+        Step::Agg(keys, aggs) => {
+            let out = keys.clone();
+            for a in aggs {
+                out.push(a.name);
+            }
+            out
+        },
+        Step::Join(_, ro, how) => {
+            let l = try names(p.kids[0]);
+            if how == How::Semi || how == How::Anti { return l; }
+            let out = l.clone();
+            for n in try names(p.kids[1]) {
+                if ro.contains(n) { continue; }
+                out.push(if l.contains(n) { n + "_right" } else { n });
+            }
+            out
+        },
+    }
+}
+
+// Expression helpers.
+
+fn conjuncts(e: Expr, out: List<Expr>) {
+    if let Node::Bin(op) = e.node {
+        if op == Op::And {
+            conjuncts(e.kids[0], out);
+            conjuncts(e.kids[1], out);
+            return;
+        }
+    }
+    out.push(e);
+}
+
+fn all_of(es: List<Expr>) -> Expr {
+    let e = es[0];
+    for k in 1..es.len() {
+        e = pkg::expr::bin(Op::And, e, es[k]);
+    }
+    e
+}
+
+/// Whether `e` looks at neighbouring rows (cumulative, rolling, shift),
+/// so its value depends on which rows reach it.
+fn windowed(e: Expr) -> bool {
+    match e.node {
+        Node::Cum(_) | Node::Roll(_, _, _) | Node::Shift(_) => return true,
+        _ => {},
+    }
+    e.kids.iter().any(|k| windowed(k))
+}
+
+fn within(e: Expr, ns: List<str>) -> bool { e.columns().iter().all(|c| ns.contains(c)) }
+
+fn any_of(e: Expr, ns: List<str>) -> bool { e.columns().iter().any(|c| ns.contains(c)) }
+
+fn token(op: Op) -> str {
+    match op {
+        Op::Eq => "==",
+        Op::Ne => "!=",
+        Op::Lt => "<",
+        Op::Le => "<=",
+        Op::Gt => ">",
+        Op::Ge => ">=",
+        _ => "",
+    }
+}
+
+fn flip(t: str) -> str {
+    match t {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        _ => t,
+    }
+}
+
+/// `col op literal` (either way round) as a statistics bound.
+fn bound(e: Expr) -> Bound | none {
+    if let Node::Bin(op) = e.node {
+        let t = token(op);
+        if t == "" { return none; }
+        let (a, b) = (e.kids[0], e.kids[1]);
+        if let Node::Col(c) = a.node {
+            if let Node::Lit(v) = b.node {
+                if !(v is Value::Null) { return Bound { col: c, op: t, v }; }
+            }
+        }
+        if let Node::Col(c) = b.node {
+            if let Node::Lit(v) = a.node {
+                if !(v is Value::Null) { return Bound { col: c, op: flip(t), v }; }
+            }
+        }
+    }
+    none
+}
+
+fn filtered(p: Plan, preds: List<Expr>) -> Plan {
+    if preds.is_empty() { p } else { over(Step::Filter(all_of(preds)), p) }
+}
+
+/// Push `preds` (conjuncts from above) as far down `p` as they stay
+/// correct; what cannot go further becomes a filter where it stopped.
+fn push(p: Plan, preds: List<Expr>) throws (TableError) -> Plan {
+    match p.step {
+        Step::Filter(e) => {
+            let mine: List<Expr> = List::new();
+            conjuncts(e, mine);
+            // A windowed filter sees the rows that reach it; it and
+            // everything above it stay put.
+            if mine.iter().any(|x| windowed(x)) || preds.iter().any(|x| windowed(x)) {
+                return filtered(over(Step::Filter(e), try push(p.kids[0], List::new())), preds);
+            }
+            let all = preds.clone();
+            for x in mine {
+                all.push(x);
+            }
+            try push(p.kids[0], all)
+        },
+        Step::Scan(s) => {
+            if preds.is_empty() { return p; }
+            let t = s.clone();
+            t.filters = t.filters.clone();
+            t.bounds = t.bounds.clone();
+            for x in preds {
+                t.filters.push(x);
+                if let bd: Bound = bound(x) { t.bounds.push(bd); }
+            }
+            leaf(Step::Scan(t))
+        },
+        Step::Frame(_) => filtered(p, preds),
+        Step::Select(_) | Step::Sort(_) => over(p.step, try push(p.kids[0], preds)),
+        Step::Limit(_) => filtered(over(p.step, try push(p.kids[0], List::new())), preds),
+        Step::With(es) => {
+            let fresh: List<str> = es.iter().map(|x| x.0).collect();
+            if es.iter().any(|x| windowed(x.1)) {
+                return filtered(over(p.step, try push(p.kids[0], List::new())), preds);
+            }
+            let down: List<Expr> = List::new();
+            let up: List<Expr> = List::new();
+            for x in preds {
+                if any_of(x, fresh) { up.push(x); } else { down.push(x); }
+            }
+            filtered(over(p.step, try push(p.kids[0], down)), up)
+        },
+        Step::Agg(keys, aggs) => {
+            let out: List<str> = aggs.iter().map(|a| a.name).collect();
+            let down: List<Expr> = List::new();
+            let up: List<Expr> = List::new();
+            for x in preds {
+                // On keys only (and no aggregate of the same name).
+                if within(x, keys) && !any_of(x, out) { down.push(x); } else { up.push(x); }
+            }
+            filtered(over(p.step, try push(p.kids[0], down)), up)
+        },
+        Step::Join(lo, ro, how) => {
+            let l = try names(p.kids[0]);
+            let r = try names(p.kids[1]);
+            let to_left = how == How::Inner || how == How::Left || how == How::Semi || how == How::Anti;
+            let to_right = how == How::Inner || how == How::Right;
+            let ln: List<Expr> = List::new();
+            let rn: List<Expr> = List::new();
+            let up: List<Expr> = List::new();
+            // Right columns as the join's output names them, and back.
+            let shown: List<str> = List::new();
+            let orig: List<str> = List::new();
+            for n in r {
+                if ro.contains(n) { continue; }
+                shown.push(if l.contains(n) { n + "_right" } else { n });
+                orig.push(n);
+            }
+            for x in preds {
+                if to_left && within(x, l) && !any_of(x, shown.iter().filter(|s| !l.contains(s)).collect()) {
+                    // Outer keys are filled from the right; keep those up.
+                    ln.push(x);
+                } else if to_right && within(x, shown) && !any_of(x, l) {
+                    rn.push(rename(x, shown, orig));
+                } else {
+                    up.push(x);
+                }
+            }
+            let _ = lo;
+            filtered(Plan { step: p.step, kids: [try push(p.kids[0], ln), try push(p.kids[1], rn)] }, up)
+        },
+    }
+}
+
+/// `e` with column names `from[i]` written as `to[i]`.
+fn rename(e: Expr, from: List<str>, to: List<str>) -> Expr {
+    let node = e.node;
+    if let Node::Col(c) = e.node {
+        if let i: usize = from.iter().position(|x| x == c) { node = Node::Col(to[i]); }
+    }
+    Expr { node, kids: e.kids.iter().map(|k| rename(k, from, to)).collect() }
+}
+
+fn union(a: List<str>, b: List<str>) -> List<str> {
+    let out = a.clone();
+    for x in b {
+        if !out.contains(x) { out.push(x); }
+    }
+    out
+}
+
+/// `ns` in the order of `order`, those not in it last.
+fn ordered(ns: List<str>, order: List<str>) -> List<str> {
+    let out: List<str> = List::new();
+    for x in order {
+        if ns.contains(x) { out.push(x); }
+    }
+    for x in ns {
+        if !out.contains(x) { out.push(x); }
+    }
+    out
+}
+
+/// Prune `p` to the columns `need` (all of them when `none`).
+fn prune(p: Plan, need: List<str> | none) throws (TableError) -> Plan {
+    match p.step {
+        Step::Frame(t) => match need {
+            ns: List<str> => {
+                let all = t.names();
+                let keep = ordered(ns.iter().filter(|x| all.contains(x)).collect(), all);
+                if keep.len() == all.len() { p } else { over(Step::Select(keep), p) }
+            },
+            none => p,
+        },
+        Step::Scan(s) => {
+            let ns = need ?? return p;
+            let all = try s.file_names();
+            let t = s.clone();
+            let want = ordered(ns.iter().filter(|x| all.contains(x)).collect(), all);
+            let read = want.clone();
+            for f in s.filters {
+                read = union(read, f.columns().iter().filter(|x| all.contains(x)).collect());
+            }
+            t.cols = ordered(read, all);
+            t.keep = want;
+            leaf(Step::Scan(t))
+        },
+        Step::Select(ns) => over(p.step, try prune(p.kids[0], ns)),
+        Step::Filter(e) => {
+            let down: List<str> | none = match need {
+                ns: List<str> => union(ns, e.columns()),
+                none => none,
+            };
+            over(p.step, try prune(p.kids[0], down))
+        },
+        Step::Sort(ks) => {
+            let down: List<str> | none = match need {
+                ns: List<str> => union(ns, ks.iter().map(|k| k.name).collect()),
+                none => none,
+            };
+            over(p.step, try prune(p.kids[0], down))
+        },
+        Step::Limit(_) => over(p.step, try prune(p.kids[0], need)),
+        Step::With(es) => {
+            let ns = need ?? return over(p.step, try prune(p.kids[0], none));
+            let kept: List<(str, Expr)> = es.iter().filter(|x| ns.contains(x.0)).collect();
+            let fresh: List<str> = es.iter().map(|x| x.0).collect();
+            let down: List<str> = ns.iter().filter(|x| !fresh.contains(x)).collect();
+            for (_, e) in kept {
+                down = union(down, e.columns());
+            }
+            let kid = try prune(p.kids[0], down);
+            if kept.is_empty() { kid } else { over(Step::With(kept), kid) }
+        },
+        Step::Agg(keys, aggs) => {
+            let down = keys.clone();
+            for a in aggs {
+                if a.column != "" && !down.contains(a.column) { down.push(a.column); }
+            }
+            over(p.step, try prune(p.kids[0], down))
+        },
+        Step::Join(lo, ro, how) => {
+            let ns = need ?? return Plan { step: p.step, kids: [try prune(p.kids[0], none), try prune(p.kids[1], none)] };
+            let l = try names(p.kids[0]);
+            let r = try names(p.kids[1]);
+            let ld = union(ns.iter().filter(|x| l.contains(x)).collect(), lo);
+            let rd = ro.clone();
+            if how != How::Semi && how != How::Anti {
+                for n in r {
+                    if ro.contains(n) { continue; }
+                    let shown = if l.contains(n) { n + "_right" } else { n };
+                    if ns.contains(shown) && !rd.contains(n) {
+                        rd.push(n);
+                        // Keep the left column too, so this one is
+                        // still renamed `_right`.
+                        if l.contains(n) && !ld.contains(n) { ld.push(n); }
+                    }
+                }
+            }
+            Plan { step: p.step, kids: [try prune(p.kids[0], ld), try prune(p.kids[1], rd)] }
+        },
+    }
+}
+
+/// Give a limit straight over a scan (with nothing to filter) to the
+/// scan, so it stops reading early.
+fn limits(p: Plan) -> Plan {
+    let kids: List<Plan> = p.kids.iter().map(|k| limits(k)).collect();
+    if let Step::Limit(n) = p.step {
+        if let Step::Scan(s) = kids[0].step {
+            if s.filters.is_empty() {
+                let t = s.clone();
+                t.limit = n.min(s.limit);
+                return over(p.step, leaf(Step::Scan(t)));
+            }
+        }
+    }
+    Plan { step: p.step, kids }
+}
+
+/// The plan `collect` runs.
+pub(pkg) fn optimize(p: Plan) throws (TableError) -> Plan {
+    let a = try push(p, List::new());
+    let b = try prune(a, none);
+    limits(b)
+}
+
+fn list(xs: List<str>) -> str { f"[{xs.join(", ")}]" }
+
+fn line(p: Plan) -> str {
+    match p.step {
+        Step::Frame(t) => f"TABLE {t.nrows()} rows {list(t.names())}",
+        Step::Scan(s) => {
+            let out = f"SCAN {s.kind} \"{s.path}\"";
+            if let c: List<str> = s.cols { out = out + f" read {list(c)}"; }
+            if !s.filters.is_empty() { out = out + f" filter {all_of(s.filters)}"; }
+            if let k: List<str> = s.keep {
+                let read: List<str> = s.cols ?? List::new();
+                if read != k { out = out + f" keep {list(k)}"; }
+            }
+            if s.kind == "parquet" && !s.bounds.is_empty() {
+                let bs: List<str> = s.bounds.iter().map(|b| f"{b.col} {b.op} {b.v}").collect();
+                out = out + f" row groups by {list(bs)}";
+            }
+            if s.limit != usize::MAX { out = out + f" limit {s.limit}"; }
+            out
+        },
+        Step::Select(ns) => f"SELECT {list(ns)}",
+        Step::Filter(e) => f"FILTER {e}",
+        Step::With(es) => f"WITH {list(es.iter().map(|x| f"{x.0} = {x.1}").collect())}",
+        Step::Agg(keys, aggs) => f"GROUP BY {list(keys)} AGG {list(aggs.iter().map(|a| a.name).collect())}",
+        Step::Sort(ks) => f"SORT {list(ks.iter().map(|k| if k.descending { k.name + " desc" } else { k.name }).collect())}",
+        Step::Join(lo, ro, how) => f"JOIN {how:?} ON {list(lo)} = {list(ro)}",
+        Step::Limit(n) => f"LIMIT {n}",
+    }
+}
+
+fn lines(p: Plan, depth: usize, out: List<str>) {
+    out.push("  ".repeat(depth) + line(p));
+    for k in p.kids {
+        lines(k, depth + 1, out);
+    }
+}
+
+/// The plan as text, one indented step per line.
+pub(pkg) fn show(p: Plan) -> str {
+    let out: List<str> = List::new();
+    lines(p, 0, out);
+    out.join("\n")
+}

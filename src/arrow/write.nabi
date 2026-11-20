@@ -1,0 +1,239 @@
+// The Arrow IPC writer: one schema message, a dictionary batch per
+// `cat` column, then record batches; the file format wraps the same
+// messages in magic bytes and a footer of their positions.
+
+use pkg::arrow::flat::{Fv, Slot, finish, longs, slot};
+use pkg::bytes::{pad, put_i32, put_i64, put_u32, put_u64};
+use pkg::column::Data;
+use pkg::column::bitmap::Bitmap;
+use pkg::{Column, Table};
+
+// Metadata version V5.
+const V5: i64 = 4;
+
+/// The field of column `c` named `name`; `dict` is the dictionary id
+/// for a `cat` column.
+fn field(name: str, c: Column, dict: i64) -> List<Slot> {
+    let (tid, ty) = type_of(c);
+    let f = [slot(0, Fv::Str(name)), slot(1, Fv::U8(1u64)), slot(2, Fv::U8(tid)), slot(3, Fv::Table(ty)), slot(5, Fv::Tables(List::new()))];
+    if dict >= 0 {
+        let index = [slot(0, Fv::I32(32)), slot(1, Fv::U8(1u64))];
+        f.push(slot(4, Fv::Table([slot(0, Fv::I64(dict)), slot(1, Fv::Table(index))])));
+    }
+    f
+}
+
+/// The union type id and type table of a column (a `cat` column's
+/// values are strings).
+fn type_of(c: Column) -> (u64, List<Slot>) {
+    match c.data {
+        Data::I64(_) => (2u64, [slot(0, Fv::I32(64)), slot(1, Fv::U8(1u64))]),
+        Data::F64(_) => (3u64, [slot(0, Fv::I16(2))]),
+        Data::Bool(_) => (6u64, List::new()),
+        Data::Str(xs) => (if large(xs) { 20u64 } else { 5u64 }, List::new()),
+        Data::Cat(_, lv) => (if large(lv) { 20u64 } else { 5u64 }, List::new()),
+        // DAY, not the default MILLISECOND.
+        Data::Date(_) => (8u64, [slot(0, Fv::I16(0))]),
+        Data::DateTime(_) => (10u64, [slot(0, Fv::I16(3))]),
+    }
+}
+
+/// Whether the text needs 64-bit offsets.
+fn large(xs: List<str>) -> bool {
+    let n = 0usize;
+    for s in xs {
+        n += s.len();
+    }
+    n > 2147483647
+}
+
+pub(pkg) fn schema(t: Table) -> List<Slot> {
+    let fs: List<List<Slot>> = List::new();
+    for k in 0..t.cols.len() {
+        let c = t.cols[k];
+        fs.push(field(t.names[k], c, if c.dtype() == pkg::DType::Cat { k as i64 } else { -1 }));
+    }
+    [slot(1, Fv::Tables(fs))]
+}
+
+/// A record batch body under construction: the nodes, the buffer
+/// positions and the bytes.
+struct Body {
+    nodes: List<i64>;
+    bufs: List<i64>;
+    b: List<u8>;
+}
+
+fn body() -> Body { Body { nodes: List::new(), bufs: List::new(), b: List::new() } }
+
+fn start(x: Body) -> usize { x.b.len() }
+
+fn end(x: Body, s: usize) {
+    x.bufs.push(s as i64);
+    x.bufs.push((x.b.len() - s) as i64);
+    pad(x.b, 8);
+}
+
+fn validity(x: Body, v: Bitmap | none, s: usize, e: usize) -> usize {
+    let st = start(x);
+    let nulls = 0usize;
+    if let m: Bitmap = v {
+        let k = st;
+        let byte = 0u64;
+        for i in s..e {
+            if m.get(i) {
+                byte = byte | (1u64 << ((i - s) & 7) as u64);
+            } else {
+                nulls += 1;
+            }
+            if (i - s) & 7 == 7 {
+                x.b.push(byte as u8);
+                byte = 0u64;
+            }
+        }
+        if (e - s) & 7 != 0 { x.b.push(byte as u8); }
+        if nulls == 0 { x.b.truncate(k); }
+    }
+    end(x, st);
+    nulls
+}
+
+fn strings(x: Body, xs: List<str>, s: usize, e: usize) {
+    let wide = large(xs);
+    let st = start(x);
+    let o = 0usize;
+    if wide { put_u64(x.b, 0u64); } else { put_u32(x.b, 0u64); }
+    for i in s..e {
+        o += xs[i].len();
+        if wide { put_u64(x.b, o as u64); } else { put_u32(x.b, o as u64); }
+    }
+    end(x, st);
+    let st = start(x);
+    for i in s..e {
+        for c in xs[i].as_bytes() {
+            x.b.push(c);
+        }
+    }
+    end(x, st);
+}
+
+fn column(x: Body, c: Column, s: usize, e: usize) {
+    x.nodes.push((e - s) as i64);
+    let ni = x.nodes.len();
+    x.nodes.push(0);
+    let nulls = validity(x, c.valid, s, e);
+    x.nodes[ni] = nulls as i64;
+    let st = start(x);
+    match c.data {
+        Data::I64(v) => for i in s..e { put_i64(x.b, v[i]); },
+        Data::F64(v) => for i in s..e { put_u64(x.b, v[i].to_bits()); },
+        Data::Bool(v) => {
+            let byte = 0u64;
+            for i in s..e {
+                if v[i] { byte = byte | (1u64 << ((i - s) & 7) as u64); }
+                if (i - s) & 7 == 7 {
+                    x.b.push(byte as u8);
+                    byte = 0u64;
+                }
+            }
+            if (e - s) & 7 != 0 { x.b.push(byte as u8); }
+        },
+        Data::Str(v) => {
+            strings(x, v, s, e);
+            return;
+        },
+        Data::Cat(codes, _) => for i in s..e { put_u32(x.b, codes[i] as u64); },
+        Data::Date(v) => for i in s..e { put_i32(x.b, v[i] as i64); },
+        Data::DateTime(v) => for i in s..e { put_i64(x.b, v[i]); },
+    }
+    end(x, st);
+}
+
+fn record_batch(x: Body, n: usize) -> List<Slot> {
+    [slot(0, Fv::I64(n as i64)), slot(1, Fv::Structs(longs(x.nodes), x.nodes.len() / 2)), slot(2, Fv::Structs(longs(x.bufs), x.bufs.len() / 2))]
+}
+
+fn message(kind: u64, header: List<Slot>, body_len: usize) -> List<u8> {
+    finish([slot(0, Fv::I16(V5)), slot(1, Fv::U8(kind)), slot(2, Fv::Table(header)), slot(3, Fv::I64(body_len as i64))])
+}
+
+/// Append an encapsulated message; gives (offset, metadata length,
+/// body length) for the file footer.
+fn emit(out: List<u8>, meta: List<u8>, b: List<u8>) -> (usize, usize, usize) {
+    let at = out.len();
+    put_u32(out, 0xFFFFFFFFu64);
+    put_u32(out, meta.len() as u64);
+    for c in meta {
+        out.push(c);
+    }
+    for c in b {
+        out.push(c);
+    }
+    (at, 8 + meta.len(), b.len())
+}
+
+/// The schema message alone (encapsulated), as Parquet's `ARROW:schema`
+/// metadata holds it.
+pub(pkg) fn schema_message(t: Table) -> List<u8> {
+    let out: List<u8> = List::new();
+    let _ = emit(out, message(1u64, schema(t), 0), List::new());
+    out
+}
+
+/// `t` in the IPC stream format, or the file format unless `stream`;
+/// record batches of at most `rows` rows.
+pub(pkg) fn write(t: Table, rows: usize, stream: bool) -> List<u8> {
+    let out: List<u8> = List::new();
+    if !stream {
+        pkg::bytes::put_str(out, "ARROW1");
+        out.push(0u8);
+        out.push(0u8);
+    }
+    let _ = emit(out, message(1u64, schema(t), 0), List::new());
+    let dicts: List<(usize, usize, usize)> = List::new();
+    for k in 0..t.cols.len() {
+        if let Data::Cat(_, lv) = t.cols[k].data {
+            let x = body();
+            column(x, Column::strs(lv), 0, lv.len());
+            let rb = record_batch(x, lv.len());
+            let meta = message(2u64, [slot(0, Fv::I64(k as i64)), slot(1, Fv::Table(rb))], x.b.len());
+            dicts.push(emit(out, meta, x.b));
+        }
+    }
+    let batches: List<(usize, usize, usize)> = List::new();
+    let per = rows.max(1);
+    let s = 0usize;
+    loop {
+        let e = (s + per).min(t.rows);
+        let x = body();
+        for c in t.cols {
+            column(x, c, s, e);
+        }
+        batches.push(emit(out, message(3u64, record_batch(x, e - s), x.b.len()), x.b));
+        s = e;
+        if s >= t.rows { break; }
+    }
+    // End of stream.
+    put_u32(out, 0xFFFFFFFFu64);
+    put_u32(out, 0u64);
+    if !stream {
+        let footer = finish([slot(0, Fv::I16(V5)), slot(1, Fv::Table(schema(t))), slot(2, Fv::Structs(blocks(dicts), dicts.len())), slot(3, Fv::Structs(blocks(batches), batches.len()))]);
+        for c in footer {
+            out.push(c);
+        }
+        put_u32(out, footer.len() as u64);
+        pkg::bytes::put_str(out, "ARROW1");
+    }
+    out
+}
+
+fn blocks(bs: List<(usize, usize, usize)>) -> List<u8> {
+    let b: List<u8> = List::new();
+    for (o, m, l) in bs {
+        put_u64(b, o as u64);
+        put_u32(b, m as u64);
+        put_u32(b, 0u64);
+        put_u64(b, l as u64);
+    }
+    b
+}

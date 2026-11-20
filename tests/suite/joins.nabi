@@ -1,0 +1,168 @@
+// Joins: every kind against a naive nested loop on random data with
+// fixed seeds, null keys, mixed key types, name clashes; the
+// relational operators.
+
+use pkg::{Column, How, Table, Value};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+/// The pairs a nested loop finds, in the order the hash join emits
+/// them: left rows in order, matches by right row; `-1` for no row.
+fn naive(lk: List<List<Value>>, rk: List<List<Value>>, how: How) -> List<(i64, i64)> {
+    let out: List<(i64, i64)> = List::new();
+    let eq = |i: usize, j: usize| {
+        for k in 0..lk.len() {
+            let a = lk[k][i];
+            let b = rk[k][j];
+            if a.is_null() || b.is_null() { return false; }
+            let same = match (a, b) {
+                (Value::Int(x), Value::Float(y)) => x as f64 == y,
+                (Value::Float(x), Value::Int(y)) => x == y as f64,
+                _ => a == b,
+            };
+            if !same { return false; }
+        }
+        true
+    };
+    let nl = lk[0].len();
+    let nr = rk[0].len();
+    if how == How::Right {
+        for j in 0..nr {
+            let any = false;
+            for i in 0..nl {
+                if eq(i, j) {
+                    out.push((i as i64, j as i64));
+                    any = true;
+                }
+            }
+            if !any { out.push((-1, j as i64)); }
+        }
+        return out;
+    }
+    let hit: List<bool> = List::filled(nr, false);
+    for i in 0..nl {
+        let any = false;
+        for j in 0..nr {
+            if eq(i, j) {
+                any = true;
+                hit[j] = true;
+                if how != How::Semi && how != How::Anti { out.push((i as i64, j as i64)); }
+            }
+        }
+        if how == How::Semi && any { out.push((i as i64, -1)); }
+        if how == How::Anti && !any { out.push((i as i64, -1)); }
+        if !any && (how == How::Left || how == How::Outer) { out.push((i as i64, -1)); }
+    }
+    if how == How::Outer {
+        for j in 0..nr {
+            if !hit[j] { out.push((-1, j as i64)); }
+        }
+    }
+    out
+}
+
+fn random_side(ref rng: Xoshiro256PlusPlus, n: usize, tag: str) -> Table {
+    let a: List<i64 | none> = List::from_fn(n, [ref rng] |_| if rng.below(12u64) == 0u64 { none } else { rng.below(15u64) as i64 });
+    let b: List<str | none> = List::from_fn(n, [ref rng] |_| if rng.below(15u64) == 0u64 { none } else { f"s{rng.below(4u64)}" });
+    let id: List<i64> = List::from_fn(n, |i| i as i64);
+    try Table::from_columns([("a", Column::from(a)), ("b", Column::from(b)), (tag, Column::from(id))]) catch e { panic(f"{e}"); }
+}
+
+#[test]
+fn random_against_nested_loop() {
+    let rng = Xoshiro256PlusPlus::seed(31337u64);
+    let hows = [How::Inner, How::Left, How::Right, How::Outer, How::Semi, How::Anti];
+    for round in 0..6 {
+        let l = random_side(ref rng, 80 + round * 13, "lid");
+        let r = random_side(ref rng, 60 + round * 7, "rid");
+        let r2 = if round % 2 == 1 { try r.with("b", (try r.column("b") catch e { panic(f"{e}"); }).to_cat()) catch e { panic(f"{e}"); } } else { r };
+        for keys in [["a"], ["a", "b"]] {
+            let lk: List<List<Value>> = keys.iter().map(|k| (try l.column(k) catch e { panic(f"{e}"); }).values()).collect();
+            let rk: List<List<Value>> = keys.iter().map(|k| (try r2.column(k) catch e { panic(f"{e}"); }).values()).collect();
+            for how in hows {
+                let j = try l.join(r2, keys, how) catch e { panic(f"{e}"); };
+                let want = naive(lk, rk, how);
+                assert(j.nrows() == want.len(), f"round {round} {how:?} {keys:?}: {j.nrows()} rows, want {want.len()}");
+                let lids = (try j.column("lid") catch e { panic(f"{e}"); }).to_options_i64();
+                let semi = how == How::Semi || how == How::Anti;
+                let rids: List<i64 | none> = if semi { List::new() } else { (try j.column("rid") catch e { panic(f"{e}"); }).to_options_i64() };
+                for p in 0..want.len() {
+                    let (wl, wr) = want[p];
+                    assert(lids[p] == (if wl < 0 { none } else { wl }), f"round {round} {how:?} pair {p}");
+                    if !semi { assert(rids[p] == (if wr < 0 { none } else { wr }), f"round {round} {how:?} pair {p} right"); }
+                    // Outer / right joins fill the key from the side that has the row.
+                    if !semi && wl < 0 {
+                        let key = (try j.column("a") catch e { panic(f"{e}"); }).get(p);
+                        assert(key == rk[0][wr as usize]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn names_and_mixed_keys() {
+    let a = pkg::table!{ "k": [1, 2], "v": ["a", "b"] };
+    let b = pkg::table!{ "key": [2.0, 3.0], "v": ["x", "y"] };
+    let j = try a.join_on(b, ["k"], ["key"], How::Inner) catch e { panic(f"{e}"); };
+    assert(j.names() == ["k", "v", "v_right"]);
+    assert(j.nrows() == 1 && j.row(0).str("v_right") == "x");
+    let bad = pkg::table!{ "k": ["2"] };
+    let m = try a.join(bad, ["k"], How::Inner).nrows() as i64 catch e {
+        assert(e.message().contains("i64") && e.message().contains("str"), e.message());
+        -1
+    };
+    assert(m == -1);
+    let miss = try a.join(b, ["kk"], How::Inner).nrows() as i64 catch e {
+        assert(e.message().contains("did you mean `k`"), e.message());
+        -1
+    };
+    assert(miss == -1);
+    let none_keys = try a.join_on(b, [], [], How::Inner).nrows() as i64 catch _ { -1 };
+    assert(none_keys == -1);
+}
+
+#[test]
+fn empty_sides() {
+    let a = pkg::table!{ "k": [1, 2], "v": [1.0, 2.0] };
+    let e = a.head(0);
+    assert((try a.join(e, ["k"], How::Inner) catch _ { a }).nrows() == 0);
+    let l = try a.join(e, ["k"], How::Left) catch _ { e };
+    assert(l.nrows() == 2 && l.has("v_right") && l.column_at(2).null_count() == 2);
+    assert((try e.join(a, ["k"], How::Outer) catch _ { e }).nrows() == 2);
+    assert((try e.join(a, ["k"], How::Anti) catch _ { a }).nrows() == 0);
+    assert((try a.join(e, ["k"], How::Anti) catch _ { e }).nrows() == 2);
+}
+
+#[test]
+fn large_join() {
+    let n = 200000;
+    let a = try Table::from_columns([("k", Column::from(List::from_fn(n, |i| (i * 7 % n) as i64))), ("x", Column::from(List::from_fn(n, |i| i as i64)))]) catch e { panic(f"{e}"); };
+    let b = try Table::from_columns([("k", Column::from(List::from_fn(n, |i| (i * 3) as i64))), ("y", Column::from(List::from_fn(n, |i| i as i64)))]) catch e { panic(f"{e}"); };
+    let j = try a.join(b, ["k"], How::Inner) catch e { panic(f"{e}"); };
+    // Keys 0, 3, 6, .. below n match once each.
+    assert(j.nrows() == (n + 2) / 3);
+}
+
+#[test]
+fn relational_operators() {
+    let people = pkg::table!{ "id": [1, 2, 3], "name": ["ann", "bob", "cy"] };
+    let orders = pkg::table!{ "id": [1, 1, 3, 4], "amount": [5.0, 7.0, 2.0, 9.0] };
+    let inner = people ⋈ orders;
+    assert(inner.nrows() == 3 && inner.names() == ["id", "name", "amount"]);
+    assert((people ⟕ orders).nrows() == 4);
+    assert((people ⟖ orders).nrows() == 4);
+    assert((people ⟗ orders).nrows() == 5);
+    assert((people ⋉ orders).column_at(1).to_options_str() == ["ann", "cy"]);
+    assert((people ▷ orders).column_at(1).to_options_str() == ["bob"]);
+    assert((people ⋈ orders.on(["id"])).nrows() == 3);
+    // Joins bind like `*`: tighter than `∪`.
+    let more = pkg::table!{ "id": [9], "name": ["zed"], "amount": [1.0] };
+    assert((people ⋈ orders ∪ more).nrows() == 4);
+    let a = pkg::table!{ "x": [1, 2, 2, none] };
+    let b = pkg::table!{ "x": [2, 3, none] };
+    assert((a ∪ b).column_at(0).to_options_i64() == [1, 2, none, 3]);
+    assert((a ∩ b).column_at(0).to_options_i64() == [2, none]);
+    assert((a ∖ b).column_at(0).to_options_i64() == [1]);
+    assert((a ∖ b ∖ a).nrows() == 0);
+}

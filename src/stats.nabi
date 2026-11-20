@@ -1,0 +1,80 @@
+//! Summaries: `describe`, `value_counts`, `null_counts`.
+
+use pkg::column::Data;
+use pkg::group::interpolate;
+use pkg::{Column, DType, Table, TableError, count, desc};
+use core::array::Array;
+
+impl Table {
+    /// Summary statistics of the numeric columns: one row each for
+    /// `count` (non-null), `null_count`, `mean`, `std`, `min`, `25%`,
+    /// `50%`, `75%`, `max`, under a `stat` column. Core's pairwise mean
+    /// and two-pass variance, quantiles by linear interpolation; NaN is
+    /// left out like a null.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1.0, 2.0, 3.0, 4.0], "s": ["a", "b", "c", "d"] };
+    /// let d = t.describe();
+    /// assert(d.names() == ["stat", "x"]);
+    /// assert(d.row(2).f64("x") == 2.5);    // mean
+    /// assert(d.row(6).f64("x") == 2.5);    // median
+    /// ```
+    pub fn describe(self) -> Table {
+        let stats = ["count", "null_count", "mean", "std", "min", "25%", "50%", "75%", "max"];
+        let out = Table::new();
+        out = try! out.set_column("stat", Column::strs(stats), false);
+        for k in 0..self.cols.len() {
+            let c = self.cols[k];
+            if !c.dtype().is_numeric() { continue; }
+            let xs = try! c.f64_list();
+            let vals: List<f64> = List::new();
+            for i in 0..xs.len() {
+                if c.is_valid(i) && !xs[i].is_nan() { vals.push(xs[i]); }
+            }
+            let n = vals.len();
+            let a = Array::view_list(vals, [n]);
+            let (mean, sd) = (a.mean(), a.std(ddof: 1));
+            vals.sort_by(|a, b| a.total_cmp(b));
+            let q = |p: f64| if n == 0 { f64::NAN } else { interpolate(vals, p) };
+            let col: List<f64 | none> = [
+                n as f64, (c.len() - n) as f64,
+                if n == 0 { none } else { mean },
+                if n < 2 { none } else { sd },
+                if n == 0 { none } else { vals[0] },
+                if n == 0 { none } else { q(0.25) },
+                if n == 0 { none } else { q(0.5) },
+                if n == 0 { none } else { q(0.75) },
+                if n == 0 { none } else { vals[n - 1] },
+            ];
+            out = try! out.set_column(self.names[k], Column::from(col), false);
+        }
+        out
+    }
+
+    /// Each distinct value of column `name` with how many rows hold it,
+    /// most common first (ties in order of first appearance); null is a
+    /// value too.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "c": ["x", "y", "x", none] };
+    /// let v = try t.value_counts("c") catch _ { t };
+    /// assert(v.names() == ["c", "count"]);
+    /// assert(v.row(0).str("c") == "x" && v.row(0).i64("count") == 2);
+    /// ```
+    pub fn value_counts(self, name: str) throws (TableError) -> Table {
+        let s = try (try self.group_by([name])).agg([count()]);
+        try s.sort([desc("count")])
+    }
+
+    /// Nulls per column, as a table of `column` and `null_count`.
+    pub fn null_counts(self) -> Table {
+        let names = self.names.clone();
+        let counts: List<i64> = self.cols.iter().map(|c| c.null_count() as i64).collect();
+        let t = Table::new();
+        t = try! t.set_column("column", Column::strs(names), false);
+        try! t.set_column("null_count", Column::of(Data::I64(counts)), false)
+    }
+
+    /// The type of every column, in order.
+    pub fn dtypes(self) -> List<DType> { self.cols.iter().map(|c| c.dtype()).collect() }
+}

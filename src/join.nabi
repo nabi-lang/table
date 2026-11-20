@@ -1,0 +1,187 @@
+//! Hash joins. The right table's key codes go into an `Index` (one
+//! group per distinct key, its rows contiguous); each left row is hashed
+//! and probed. Text keys of both sides share one dictionary, so the
+//! probe compares integers. A null key matches nothing.
+
+use pkg::keys;
+use pkg::keys::{Codes, Index};
+use pkg::{Column, Table, TableError};
+
+/// Which rows a join keeps.
+///
+/// | How     | Rows                                                     |
+/// |---------|----------------------------------------------------------|
+/// | `Inner` | every matching pair                                      |
+/// | `Left`  | every left row, matched or with nulls on the right       |
+/// | `Right` | every right row, matched or with nulls on the left       |
+/// | `Outer` | `Left`, then the right rows nothing matched              |
+/// | `Semi`  | left rows that have a match (left columns only)          |
+/// | `Anti`  | left rows that have none (left columns only)             |
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum How {
+    Inner,
+    Left,
+    Right,
+    Outer,
+    Semi,
+    Anti,
+}
+
+/// The right table indexed by its key: group `g`'s rows are
+/// `rows[off[g]..off[g + 1]]`, ascending.
+struct Built {
+    ix: Index;
+    codes: Codes;
+    off: List<usize>;
+    rows: List<usize>;
+}
+
+fn build(c: Codes) -> Built {
+    let (gid, ix) = keys::group(c);
+    let ng = ix.first.len();
+    let off: List<usize> = List::filled(ng + 1, 0);
+    for i in 0..c.n {
+        if !null_at(c, i) { off[gid[i] as usize + 1] += 1; }
+    }
+    for g in 0..ng { off[g + 1] += off[g]; }
+    let pos = off.clone();
+    let rows: List<usize> = List::filled(off[ng], 0);
+    for i in 0..c.n {
+        if null_at(c, i) { continue; }
+        let g = gid[i] as usize;
+        rows[pos[g]] = i;
+        pos[g] += 1;
+    }
+    Built { ix, codes: c, off, rows }
+}
+
+fn null_at(c: Codes, i: usize) -> bool {
+    match c.null {
+        x: List<bool> => x[i],
+        none => false,
+    }
+}
+
+/// Matching row pairs of `l` against built `r`, left rows in order
+/// (`-1` for no match when `keep_left`).
+fn probe(l: Codes, r: Built, keep_left: bool, li: List<i64>, ri: List<i64>, matched: List<bool> | none) {
+    let h = keys::hashes(l);
+    for i in 0..l.n {
+        let g: i64 = if null_at(l, i) { -1 } else { r.ix.find(h[i], r.codes, l, i) };
+        // A group of only null-key rows (their codes can equal a real
+        // key) matches nothing.
+        if g >= 0 && r.off[g as usize] == r.off[g as usize + 1] { g = -1; }
+        if g < 0 {
+            if keep_left {
+                li.push(i as i64);
+                ri.push(-1);
+            }
+            continue;
+        }
+        let gu = g as usize;
+        for j in r.off[gu]..r.off[gu + 1] {
+            li.push(i as i64);
+            ri.push(r.rows[j] as i64);
+        }
+        if let m: List<bool> = matched { m[gu] = true; }
+    }
+}
+
+impl Table {
+    /// Join with `o` on the columns `on`, present in both.
+    ///
+    /// ```nabi
+    /// use table::How;
+    /// let a = table::table!{ "id": [1, 2, 3], "x": ["a", "b", "c"] };
+    /// let b = table::table!{ "id": [3, 1, 1], "y": [30.0, 10.0, 11.0] };
+    /// let j = try a.join(b, ["id"], How::Inner) catch _ { a };
+    /// assert(j.names() == ["id", "x", "y"]);
+    /// assert(j.nrows() == 3);
+    /// let l = try a.join(b, ["id"], How::Left) catch _ { a };
+    /// assert(l.nrows() == 4 && l.row(2).f64("y") is none);
+    /// ```
+    pub fn join(self, o: Table, on: List<str>, how: How) throws (TableError) -> Table {
+        try self.join_on(o, on, on, how)
+    }
+
+    /// Join where the key columns have different names: `left_on[k]`
+    /// of this table matches `right_on[k]` of `o`. The result has this
+    /// table's columns, then `o`'s other columns; a name both sides use
+    /// gets `_right` on `o`'s side. For `Outer` / `Right`, a key column
+    /// holds the key of whichever side has the row.
+    pub fn join_on(self, o: Table, left_on: List<str>, right_on: List<str>, how: How) throws (TableError) -> Table {
+        if left_on.len() != right_on.len() || left_on.is_empty() {
+            throw TableError::invalid(f"join needs one or more key pairs, {left_on.len()} left and {right_on.len()} right given; pass lists of equal length");
+        }
+        let lk = try keys::positions(self, left_on);
+        let rk = try keys::positions(o, right_on);
+        let (lc, rc) = try keys::pair_codes(self, lk, o, rk);
+        if how == How::Right {
+            // The left join of the swapped tables, columns put back.
+            let b = build(lc);
+            let ri: List<i64> = List::new();
+            let li: List<i64> = List::new();
+            probe(rc, b, true, ri, li, none);
+            return try self.assemble(o, lk, rk, li, ri, how);
+        }
+        let b = build(rc);
+        let li: List<i64> = List::new();
+        let ri: List<i64> = List::new();
+        if how == How::Semi || how == How::Anti {
+            let h = keys::hashes(lc);
+            let keep: List<usize> = List::new();
+            for i in 0..lc.n {
+                let g = if null_at(lc, i) { -1 } else { b.ix.find(h[i], b.codes, lc, i) };
+                let hit = g >= 0 && b.off[g as usize] < b.off[g as usize + 1];
+                if hit == (how == How::Semi) { keep.push(i); }
+            }
+            return self.take_unchecked(keep);
+        }
+        let matched: List<bool> | none = if how == How::Outer { List::filled(b.ix.first.len(), false) } else { none };
+        probe(lc, b, how != How::Inner, li, ri, matched);
+        if let m: List<bool> = matched {
+            // Right rows with no partner: matched groups are skipped,
+            // null-key rows are always unmatched.
+            let unmatched_group: List<bool> = List::from_fn(m.len(), |g| !m[g]);
+            let gid_of: List<i64> = List::filled(rc.n, -1);
+            for g in 0..b.off.len() - 1 {
+                for j in b.off[g]..b.off[g + 1] { gid_of[b.rows[j]] = g as i64; }
+            }
+            for r in 0..rc.n {
+                let g = gid_of[r];
+                if g < 0 || unmatched_group[g as usize] {
+                    li.push(-1);
+                    ri.push(r as i64);
+                }
+            }
+        }
+        try self.assemble(o, lk, rk, li, ri, how)
+    }
+
+    /// The joined table from row pairs (`-1`: no row on that side).
+    fn assemble(self, o: Table, lk: List<usize>, rk: List<usize>, li: List<i64>, ri: List<i64>, how: How) throws (TableError) -> Table {
+        let out = Table::new();
+        let coalesce = how == How::Outer || how == How::Right;
+        for k in 0..self.cols.len() {
+            let c = self.cols[k].take_or_null(li);
+            let pos = lk.iter().position(|x| x == k);
+            if coalesce {
+                if let j: usize = pos {
+                    // Fill the key from the right side where the left has no row.
+                    let rc = o.cols[rk[j]].take_or_null(ri);
+                    let vs = List::from_fn(li.len(), |i| if li[i] >= 0 { c.get(i) } else { rc.get(i) });
+                    c = try Column::from_values(vs, c.dtype()) catch _ {
+                        try Column::from_values(vs, none)
+                    };
+                }
+            }
+            out = try out.set_column(self.names[k], c, false);
+        }
+        for k in 0..o.cols.len() {
+            if rk.contains(k) { continue; }
+            let name = if self.has(o.names[k]) { o.names[k] + "_right" } else { o.names[k] };
+            out = try out.set_column(name, o.cols[k].take_or_null(ri), false);
+        }
+        out
+    }
+}

@@ -1,0 +1,113 @@
+// Parquet: round trips of every type with nulls, row groups, pages,
+// compression and dictionaries; projection; statistics; cut files.
+
+use pkg::{Column, Compression, DType, Parquet, Table};
+
+fn sample() -> Table {
+    let t = pkg::table!{
+        "id": [1, 2, 3, -4],
+        "x": [0.5, none, -2.25, 1e300],
+        "ok": [true, false, none, true],
+        "s": ["a", "", none, "é한"],
+        "d": [date"2024-01-01", none, date"1969-12-31", date"2000-02-29"],
+        "t": [datetime"2024-01-01T10:30:00", datetime"1960-01-01T00:00:00", none, datetime"2024-02-29T23:59:59.123456789"],
+    };
+    try! t.with("c", Column::cat(["red", "blue", "red", "green"]))
+}
+
+fn back(t: Table, p: Parquet) -> Table { try p.read_bytes(p.write_bytes(t)) catch e { panic(f"{e}"); } }
+
+#[test]
+fn round_trip_types() {
+    let t = sample();
+    for c in [Compression::Snappy, Compression::None] {
+        let r = back(t, Parquet::new().compression(c));
+        assert(r == t, f"{r}");
+        assert(r.dtypes() == t.dtypes());
+    }
+    // Without dictionary pages a `cat` column still reads back as `cat`
+    // through the Arrow schema in the metadata.
+    assert(back(t, Parquet::new().dictionary(false)) == t);
+}
+
+#[test]
+fn groups_and_pages() {
+    let n = 5000usize;
+    let big = try! Table::from_columns([
+        ("i", Column::from(List::from_fn(n, |i| i as i64 * 3 - 7000))),
+        ("f", Column::from(List::from_fn(n, |i| -> f64 | none { if i % 7 == 0 { none } else { i as f64 * 0.5 } }))),
+        ("s", Column::from(List::from_fn(n, |i| f"k{i % 13}"))),
+        ("u", Column::from(List::from_fn(n, |i| f"unique {i}"))),
+        ("b", Column::from(List::from_fn(n, |i| i % 3 == 0))),
+    ]);
+    for (g, p) in [(1000usize, 64usize), (n, n), (333, 1000), (1, 1)] {
+        if g == 1 { continue; }
+        assert(back(big, Parquet::new().row_group_rows(g).page_rows(p)) == big, f"{g} {p}");
+    }
+    let small = big.head(30);
+    assert(back(small, Parquet::new().row_group_rows(1).page_rows(1)) == small);
+}
+
+#[test]
+fn empty_and_projection() {
+    let e = try! Table::from_columns([("a", Column::i64s([])), ("b", Column::strs([]))]);
+    let r = back(e, Parquet::new());
+    assert(r.shape() == (0, 2) && r.dtypes() == [DType::I64, DType::Str]);
+    let t = sample();
+    let b = Parquet::new().write_bytes(t);
+    let p = try! Parquet::new().columns(["t", "id"]).read_bytes(b);
+    assert(p == try! t.select(["t", "id"]));
+    let s = try! pkg::parquet_schema(b);
+    assert(s.names() == t.names() && s.dtype("c") == DType::Cat && s.dtype("t") == DType::DateTime);
+    let msg = "";
+    try Parquet::new().columns(["nope"]).read_bytes(b) catch e { msg = e.message(); };
+    assert(msg.contains("no column `nope`"), msg);
+}
+
+#[test]
+fn cut_files_are_errors() {
+    let b = Parquet::new().write_bytes(sample());
+    for cut in [0usize, 4, 11, b.len() / 2, b.len() - 1] {
+        assert((try? Parquet::new().read_bytes(b[0:cut].to_list())) is none, f"cut {cut}");
+    }
+    // A flipped byte inside the data either reads or fails, never panics.
+    for k in [8usize, 40, 100, b.len() / 3] {
+        let c = b.clone();
+        c[k] = c[k] ^ 0x5Au8;
+        let _ = try? Parquet::new().read_bytes(c);
+    }
+}
+
+// tests/data/mixed.parquet: written by an independent encoder. Group 1
+// has data pages v1, uncompressed; group 2 has data pages v2 compressed
+// by the zstd tool. Columns: int8 (INTEGER logical), UINT_32, INT96,
+// TIMESTAMP_MICROS, TIMESTAMP(MILLIS, UTC), FLOAT, PLAIN_DICTIONARY
+// strings, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY,
+// DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT, RLE booleans, and a nested list
+// column `tags`.
+const COLS: [str; 12] = ["i8", "u32", "i96", "us", "msutc", "f", "ds", "dbp", "dlba", "dba", "bss", "rb"];
+
+#[test]
+fn foreign_file() {
+    let t = try Parquet::new().columns(COLS.to_list()).read_file("tests/data/mixed.parquet") catch e { panic(f"{e}"); };
+    let want = pkg::table!{
+        "i8": [-5, none, 7, 8],
+        "u32": [4000000000, 0, 1, 2],
+        "i96": [datetime"1970-01-02T01:00:00", none, datetime"1969-12-31T00:00:00", none],
+        "us": [datetime"1970-01-01T00:00:01.5", none, datetime"1969-12-31T23:59:59.999999", datetime"1970-01-01T00:00:00.000005"],
+        "msutc": [datetime"1969-12-31T23:59:59", datetime"1970-01-01T00:00:00", datetime"1970-01-02T00:00:00", datetime"1970-01-01T00:00:00.001"],
+        "f": [1.25, -0.5, 3.0, 4.0],
+        "ds": ["apple", "pear", "apple", none],
+        "dbp": [10, 12, 9, 100],
+        "dlba": ["x", none, "yy", ""],
+        "dba": ["prefix_a", "prefix_b", "prefix_bc", "q"],
+        "bss": [0.5, -1.5, 2.25, 8.0],
+        "rb": [true, true, false, true],
+    };
+    assert(t == want, f"{t}");
+    let msg = "";
+    try Parquet::new().read_file("tests/data/mixed.parquet") catch e { msg = e.message(); };
+    assert(msg.contains("`tags` is a nested"), msg);
+    let s = try! pkg::parquet_schema(try! std::fs::read("tests/data/mixed.parquet"));
+    assert(s.names() == COLS.to_list());
+}

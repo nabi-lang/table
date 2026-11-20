@@ -1,0 +1,21 @@
+// Columns to and from `core::array` arrays, 1e7 f64 values.
+
+use pkg::{Column, Table};
+use core::array::Array;
+use core::bench::Bench;
+use core::hint::black_box;
+
+const N: usize = 10000000;
+
+#[bench]
+fn from_array_1e7(b: Bench) {
+    let a: Array<f64, 1> = Array::from_fn([N], |i: [usize; 1]| -> f64 { i[0] as f64 });
+    b.iter(|| Column::from_array(black_box(a)));
+}
+
+#[bench]
+fn to_f64_sum_1e7(b: Bench) {
+    let a: Array<f64, 1> = Array::from_fn([N], |i: [usize; 1]| -> f64 { i[0] as f64 });
+    let t = try Table::from_columns([("x", Column::from_array(a))]) catch e { panic(f"{e}"); };
+    b.iter(|| (try black_box(t).f64("x") catch e { panic(f"{e}"); }).sum());
+}

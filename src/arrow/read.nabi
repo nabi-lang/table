@@ -1,0 +1,605 @@
+// The Arrow IPC reader: the file format (through its footer) and the
+// stream format (message by message), record batches decoded column by
+// column into the table's lists, batches joined at the end.
+
+use pkg::arrow::flat::{get_i16, get_i32, get_i64, get_str, get_table, get_u8, get_vec, root, vec_table};
+use pkg::bytes::{bad, f32_at, f64_at, i32_at, i64_at, need, text_at, u16_at, u32_at};
+use pkg::column::Data;
+use pkg::column::bitmap::Bitmap;
+use pkg::{Column, DType, Field, Schema, Table, TableError};
+
+const FMT: str = "arrow";
+
+/// A schema field: its name, type id and type table, dictionary id (-1
+/// for none) with the index width, and children.
+pub(pkg) struct Fld {
+    pub(pkg) name: str;
+    pub(pkg) ty: u64;
+    pub(pkg) tt: usize;
+    pub(pkg) dict: i64;
+    pub(pkg) iw: i64;
+    pub(pkg) kids: List<Fld>;
+}
+
+/// An encapsulated message: its kind, header table and body.
+struct Msg {
+    kind: u64;
+    header: usize;
+    body: usize;
+    body_len: usize;
+    next: usize;
+}
+
+fn fail(msg: str) -> TableError { bad(FMT, msg) }
+
+/// The message at `p`, `none` at the end-of-stream marker or the end of
+/// the data.
+fn message(b: List<u8>, p: usize) throws (TableError) -> Msg | none {
+    if p + 4 > b.len() { return none; }
+    let q = p;
+    let len = u32_at(b, q);
+    if len == 0xFFFFFFFFu64 {
+        try need(b, q, 8, FMT);
+        q += 4;
+        len = u32_at(b, q);
+    }
+    if len == 0u64 { return none; }
+    let meta = q + 4;
+    try need(b, meta, len as usize, FMT);
+    let t = try root(b, meta);
+    let version = get_i16(b, t, 0, 0);
+    if version < 3 { throw fail(f"metadata version {version + 1} is older than V4; write the file with a current Arrow library"); }
+    let kind = get_u8(b, t, 1, 0u64);
+    let header = try get_table(b, t, 2) ?? throw fail("a message has no header");
+    let body = meta + len as usize;
+    let body_len = get_i64(b, t, 3, 0);
+    if body_len < 0 { throw fail("a message has a negative body length"); }
+    try need(b, body, body_len as usize, FMT);
+    Msg { kind, header, body, body_len: body_len as usize, next: body + body_len as usize }
+}
+
+fn fld(b: List<u8>, f: usize) throws (TableError) -> Fld {
+    let name = try get_str(b, f, 0) ?? "";
+    let ty = get_u8(b, f, 2, 0u64);
+    let tt = try get_table(b, f, 3) ?? 0usize;
+    let dict = -1;
+    let iw = 32;
+    if let d: usize = try get_table(b, f, 4) {
+        dict = get_i64(b, d, 0, 0);
+        if let it: usize = try get_table(b, d, 1) { iw = get_i32(b, it, 0, 32); }
+    }
+    let (first, n) = try get_vec(b, f, 5, 4);
+    let kids: List<Fld> = List::new();
+    for i in 0..n {
+        kids.push(try fld(b, try vec_table(b, first, i)));
+    }
+    Fld { name, ty, tt, dict, iw, kids }
+}
+
+pub(pkg) fn fields(b: List<u8>, schema: usize) throws (TableError) -> List<Fld> {
+    if get_i16(b, schema, 0, 0) != 0 { throw fail("the data is big-endian; only little-endian Arrow data reads here"); }
+    let (first, n) = try get_vec(b, schema, 1, 4);
+    let out: List<Fld> = List::new();
+    for i in 0..n {
+        out.push(try fld(b, try vec_table(b, first, i)));
+    }
+    out
+}
+
+/// The nodes and buffers field `f` takes in a record batch.
+fn counts(b: List<u8>, f: Fld) throws (TableError) -> (usize, usize) {
+    if f.dict >= 0 { return (1, 2); }
+    let (n, k) = match f.ty {
+        1 => (1usize, 0usize),
+        2 | 3 | 6 | 7 | 8 | 9 | 10 | 11 | 15 | 18 => (1, 2),
+        4 | 5 | 19 | 20 => (1, 3),
+        12 | 17 | 21 => (1, 2),
+        13 | 16 => (1, 1),
+        14 => (1, if get_i16(b, f.tt, 0, 0) == 1 { 2 } else { 1 }),
+        22 => (1, 0),
+        _ => throw fail(f"column `{f.name}` has type id {f.ty} (a view type or newer), which cannot be skipped or read here; write it as utf8 or binary"),
+    };
+    for c in f.kids {
+        let (a, d) = try counts(b, c);
+        n += a;
+        k += d;
+    }
+    (n, k)
+}
+
+/// The type a field reads as, or why it cannot be read.
+pub(pkg) fn dtype(f: Fld) throws (TableError) -> DType {
+    if f.dict >= 0 {
+        if f.ty == 5u64 || f.ty == 20u64 { return DType::Cat; }
+        throw fail(f"column `{f.name}` is dictionary-encoded {kind(f.ty)}; only dictionaries of strings read here, so write it unencoded");
+    }
+    match f.ty {
+        1 => DType::F64,
+        2 => DType::I64,
+        3 => DType::F64,
+        5 | 20 => DType::Str,
+        6 => DType::Bool,
+        8 => DType::Date,
+        10 => DType::DateTime,
+        _ => throw fail(f"column `{f.name}` is {kind(f.ty)}, which this package does not read; drop it with `Arrow::columns`, or write it as one of int, float, bool, utf8, date or timestamp"),
+    }
+}
+
+fn kind(t: u64) -> str {
+    match t {
+        4 => "binary",
+        7 => "decimal",
+        9 => "time",
+        11 => "interval",
+        12 => "list",
+        13 => "struct",
+        14 => "union",
+        15 => "fixed-size binary",
+        16 => "fixed-size list",
+        17 => "map",
+        18 => "duration",
+        19 => "large binary",
+        21 => "large list",
+        22 => "run-end encoded",
+        23 => "binary view",
+        24 => "utf8 view",
+        _ => f"type {t}",
+    }
+}
+
+/// A buffer of a record batch: the bytes and the range in them.
+struct Buf {
+    b: List<u8>;
+    s: usize;
+    n: usize;
+}
+
+/// Reads one record batch's nodes and buffers in order.
+struct Batch {
+    b: List<u8>;
+    body: usize;
+    body_len: usize;
+    nodes: usize;
+    nn: usize;
+    bufs: usize;
+    nb: usize;
+    ni: usize;
+    bi: usize;
+    codec: i64;
+}
+
+fn batch(b: List<u8>, rb: usize, body: usize, body_len: usize) throws (TableError) -> Batch {
+    let (nodes, nn) = try get_vec(b, rb, 1, 16);
+    let (bufs, nb) = try get_vec(b, rb, 2, 16);
+    let codec = -1;
+    if let c: usize = try get_table(b, rb, 3) { codec = get_u8(b, c, 0, 0u64) as i64; }
+    Batch { b, body, body_len, nodes, nn, bufs, nb, ni: 0, bi: 0, codec }
+}
+
+fn node(ref x: Batch) throws (TableError) -> (usize, usize) {
+    if x.ni >= x.nn { throw fail("a record batch has fewer field nodes than its schema needs"); }
+    let p = x.nodes + 16 * x.ni;
+    x.ni += 1;
+    let n = i64_at(x.b, p);
+    let z = i64_at(x.b, p + 8);
+    if n < 0 || z < 0 || z > n { throw fail("a field node has a negative or impossible length"); }
+    (n as usize, z as usize)
+}
+
+fn buffer(ref x: Batch) throws (TableError) -> Buf {
+    if x.bi >= x.nb { throw fail("a record batch has fewer buffers than its schema needs"); }
+    let p = x.bufs + 16 * x.bi;
+    x.bi += 1;
+    let o = i64_at(x.b, p);
+    let n = i64_at(x.b, p + 8);
+    if o < 0 || n < 0 || (o + n) as usize > x.body_len { throw fail("a buffer lies outside its message body"); }
+    let s = x.body + o as usize;
+    if x.codec < 0 || n == 0 { return Buf { b: x.b, s, n: n as usize }; }
+    if n < 8 { throw fail("a compressed buffer is shorter than its length prefix"); }
+    let raw = i64_at(x.b, s);
+    if raw == -1 { return Buf { b: x.b, s: s + 8, n: n as usize - 8 }; }
+    let out = if x.codec == 1 {
+        try pkg::codec::zstd::decompress(x.b, s + 8, s + n as usize)
+    } else {
+        try pkg::codec::lz4::frame(x.b, s + 8, s + n as usize)
+    };
+    if out.len() != raw as usize { throw fail(f"a buffer decompressed to {out.len()} bytes, not the {raw} its prefix says"); }
+    Buf { b: out, s: 0, n: out.len() }
+}
+
+fn skip(ref x: Batch, f: Fld) throws (TableError) {
+    let (n, k) = try counts(x.b, f);
+    x.ni += n;
+    x.bi += k;
+}
+
+fn bits_need(buf: Buf, n: usize) throws (TableError) {
+    if buf.n * 8 < n { throw fail("a bitmap buffer is shorter than its column"); }
+}
+
+fn validity(buf: Buf, n: usize, nulls: usize) throws (TableError) -> Bitmap | none {
+    if nulls == 0 || buf.n == 0 { return none; }
+    try bits_need(buf, n);
+    let w: List<u64> = List::filled((n + 63) / 64, 0u64);
+    let nb = (n + 7) / 8;
+    for i in 0..nb {
+        w[i >> 3] = w[i >> 3] | ((buf.b[buf.s + i] as u64) << ((i & 7) * 8) as u64);
+    }
+    // Bits past the end stay clear for `nulls`.
+    if n & 63 != 0 { w[w.len() - 1] = w[w.len() - 1] & ((1u64 << (n & 63) as u64) - 1u64); }
+    Bitmap { words: w, len: n }
+}
+
+fn ints(buf: Buf, n: usize, bits: i64, signed: bool) throws (TableError) -> List<i64> {
+    let w = (bits / 8) as usize;
+    if w != 1 && w != 2 && w != 4 && w != 8 { throw fail(f"an integer of {bits} bits"); }
+    if buf.n < n * w { throw fail("a value buffer is shorter than its column"); }
+    let b = buf.b;
+    let s = buf.s;
+    let out: List<i64> = List::with_capacity(n);
+    if w == 8 {
+        for i in 0..n {
+            let v = i64_at(b, s + 8 * i);
+            if !signed && v < 0 { throw fail("a uint64 value does not fit in i64"); }
+            out.push(v);
+        }
+    } else if w == 4 {
+        if signed {
+            for i in 0..n { out.push(i32_at(b, s + 4 * i)); }
+        } else {
+            for i in 0..n { out.push(u32_at(b, s + 4 * i) as i64); }
+        }
+    } else if w == 2 {
+        for i in 0..n {
+            let v = u16_at(b, s + 2 * i) as i64;
+            out.push(if signed && v >= 32768 { v - 65536 } else { v });
+        }
+    } else {
+        for i in 0..n {
+            let v = b[s + i] as i64;
+            out.push(if signed && v >= 128 { v - 256 } else { v });
+        }
+    }
+    out
+}
+
+fn half(h: u64) -> f64 {
+    let sign = if h & 0x8000u64 != 0u64 { -1.0 } else { 1.0 };
+    let e = ((h >> 10u64) & 31u64) as i32;
+    let m = (h & 1023u64) as f64;
+    if e == 0 { return sign * m * 5.960464477539063e-8; }
+    if e == 31 { return if m == 0.0 { sign * f64::INFINITY } else { f64::NAN }; }
+    sign * (1.0 + m / 1024.0) * 2.0.powi(e - 15)
+}
+
+fn floats(buf: Buf, n: usize, prec: i64) throws (TableError) -> List<f64> {
+    let w = if prec == 2 { 8usize } else if prec == 1 { 4 } else { 2 };
+    if buf.n < n * w { throw fail("a value buffer is shorter than its column"); }
+    let b = buf.b;
+    let s = buf.s;
+    let out: List<f64> = List::with_capacity(n);
+    if w == 8 {
+        for i in 0..n { out.push(f64_at(b, s + 8 * i)); }
+    } else if w == 4 {
+        for i in 0..n { out.push(f32_at(b, s + 4 * i)); }
+    } else {
+        for i in 0..n { out.push(half(u16_at(b, s + 2 * i))); }
+    }
+    out
+}
+
+fn texts(offs: Buf, data: Buf, n: usize, wide: bool) throws (TableError) -> List<str> {
+    let w = if wide { 8usize } else { 4usize };
+    let out: List<str> = List::with_capacity(n);
+    if n == 0 { return out; }
+    if offs.n < (n + 1) * w { throw fail("an offsets buffer is shorter than its column"); }
+    let o = |i: usize| -> i64 { if wide { i64_at(offs.b, offs.s + 8 * i) } else { i32_at(offs.b, offs.s + 4 * i) } };
+    for i in 0..n {
+        let a = o(i);
+        let e = o(i + 1);
+        if a < 0 || e < a || e as usize > data.n { throw fail("string offsets point outside their data"); }
+        out.push(try text_at(data.b, data.s + a as usize, (e - a) as usize, FMT));
+    }
+    out
+}
+
+/// One column of a batch: its data and validity.
+struct Piece {
+    d: Data;
+    v: Bitmap | none;
+    n: usize;
+}
+
+fn decode(ref x: Batch, f: Fld, dicts: Dict<i64, List<str>>) throws (TableError) -> Piece {
+    let t = try dtype(f);
+    let (n, nulls) = try node(ref x);
+    // The null type has no buffers: every row is null.
+    if f.ty == 1u64 { return Piece { d: Data::F64(List::filled(n, 0.0)), v: Bitmap::from_flags(List::filled(n, false)), n }; }
+    let v = try validity(try buffer(ref x), n, nulls);
+    let b = x.b;
+    let d = match t {
+        DType::Cat => {
+            let codes = try ints(try buffer(ref x), n, f.iw, true);
+            let lv = dicts.get(f.dict) ?? throw fail(f"column `{f.name}` uses dictionary {f.dict}, which no dictionary batch defines");
+            let out: List<u32> = List::with_capacity(n);
+            for i in 0..n {
+                let c = codes[i];
+                let null = match v {
+                    m: Bitmap => !m.get(i),
+                    none => false,
+                };
+                if null { c = 0; } else if c < 0 || c as usize >= lv.len() { throw fail(f"column `{f.name}`: a dictionary index is out of range"); }
+                out.push(c as u32);
+            }
+            Data::Cat(out, lv)
+        },
+        DType::I64 => Data::I64(try ints(try buffer(ref x), n, get_i32(b, f.tt, 0, 64), get_u8(b, f.tt, 1, 0u64) != 0u64)),
+        DType::F64 => Data::F64(try floats(try buffer(ref x), n, get_i16(b, f.tt, 0, 0))),
+        DType::Bool => {
+            let buf = try buffer(ref x);
+            try bits_need(buf, n);
+            Data::Bool(List::from_fn(n, |i| (buf.b[buf.s + (i >> 3)] >> (i & 7) as u8) & 1u8 == 1u8))
+        },
+        DType::Str => {
+            let o = try buffer(ref x);
+            let dbuf = try buffer(ref x);
+            Data::Str(try texts(o, dbuf, n, f.ty == 20u64))
+        },
+        DType::Date => {
+            if get_i16(b, f.tt, 0, 1) == 0 {
+                Data::Date(mapl(try ints(try buffer(ref x), n, 32, true), |d: i64| -> i32 { d as i32 }))
+            } else {
+                Data::Date(mapl(try ints(try buffer(ref x), n, 64, true), |ms: i64| -> i32 { ms.div_euclid(86400000) as i32 }))
+            }
+        },
+        DType::DateTime => {
+            let k = match get_i16(b, f.tt, 0, 0) {
+                0 => 1000000000,
+                1 => 1000000,
+                2 => 1000,
+                _ => 1,
+            };
+            let raw = try ints(try buffer(ref x), n, 64, true);
+            if k > 1 {
+                for i in 0..n {
+                    let r = raw[i];
+                    if r > i64::MAX / k || r < i64::MIN / k { throw fail(f"column `{f.name}`: a timestamp is out of the nanosecond range"); }
+                    raw[i] = r * k;
+                }
+            }
+            Data::DateTime(raw)
+        },
+    };
+    Piece { d, v, n }
+}
+
+fn mapl<T, U>(xs: List<T>, f: fn(T) -> U) -> List<U> {
+    let out: List<U> = List::with_capacity(xs.len());
+    for x in xs {
+        out.push(f(x));
+    }
+    out
+}
+
+/// What a read keeps: the schema's fields, which of them, and per kept
+/// field its pieces.
+struct Reader {
+    b: List<u8>;
+    fs: List<Fld>;
+    keep: List<usize>;
+    slot: List<i64>;
+    parts: List<List<Piece>>;
+    dicts: Dict<i64, List<str>>;
+    replaced: List<i64>;
+    rows: usize;
+}
+
+fn reader(b: List<u8>, fs: List<Fld>, cols: List<str> | none) throws (TableError) -> Reader {
+    let keep: List<usize> = List::new();
+    match cols {
+        names: List<str> => for nm in names {
+            let k = fs.iter().position(|f| f.name == nm);
+            match k {
+                i: usize => keep.push(i),
+                none => throw TableError::missing(nm, fs.iter().map(|f| f.name).collect()),
+            }
+        },
+        none => for i in 0..fs.len() { keep.push(i); },
+    }
+    let slot: List<i64> = List::filled(fs.len(), -1);
+    for j in 0..keep.len() {
+        let _ = try dtype(fs[keep[j]]);
+        if slot[keep[j]] >= 0 { throw TableError::DuplicateColumn { name: fs[keep[j]].name }; }
+        slot[keep[j]] = j as i64;
+    }
+    Reader { b, fs, keep, slot, parts: List::from_fn(keep.len(), |_| List::new()), dicts: Dict::new(), replaced: List::new(), rows: 0 }
+}
+
+fn on_dict(b: List<u8>, ref r: Reader, m: Msg) throws (TableError) {
+    let id = get_i64(b, m.header, 0, 0);
+    let rb = try get_table(b, m.header, 1) ?? throw fail("a dictionary batch has no data");
+    let delta = get_u8(b, m.header, 2, 0u64) != 0u64;
+    let f = r.fs.iter().find(|f| f.dict == id);
+    let fd = f ?? return;
+    let x = try batch(b, rb, m.body, m.body_len);
+    let vf = Fld { name: fd.name, ty: fd.ty, tt: fd.tt, dict: -1, iw: 32, kids: List::new() };
+    let p = try decode(ref x, vf, r.dicts);
+    let lv = match p.d {
+        Data::Str(xs) => xs,
+        _ => List::new(),
+    };
+    match r.dicts.get(id) {
+        old: List<str> => if delta {
+            for s in lv {
+                old.push(s);
+            }
+        } else {
+            r.replaced.push(id);
+            r.dicts.insert(id, lv);
+        },
+        none => r.dicts.insert(id, lv),
+    }
+}
+
+fn on_batch(b: List<u8>, ref r: Reader, m: Msg) throws (TableError) {
+    let n = get_i64(b, m.header, 0, 0);
+    if n < 0 { throw fail("a record batch has a negative length"); }
+    let x = try batch(b, m.header, m.body, m.body_len);
+    for i in 0..r.fs.len() {
+        let j = r.slot[i];
+        if j >= 0 {
+            let p = try decode(ref x, r.fs[i], r.dicts);
+            if p.n != n as usize { throw fail(f"column `{r.fs[i].name}` has {p.n} values in a batch of {n} rows"); }
+            r.parts[j as usize].push(p);
+        } else {
+            try skip(ref x, r.fs[i]);
+        }
+    }
+    r.rows += n as usize;
+}
+
+fn done(r: Reader) throws (TableError) -> Table {
+    let t = Table::new();
+    for j in 0..r.keep.len() {
+        let f = r.fs[r.keep[j]];
+        let c = merge(r.parts[j], try dtype(f), r.replaced.contains(f.dict));
+        t = try t.set_column(f.name, c, false);
+    }
+    if r.keep.is_empty() { t.rows = r.rows; }
+    t
+}
+
+/// The pieces of one column as one column; `decat` when the pieces'
+/// dictionaries were replaced along the way.
+fn merge(ps: List<Piece>, t: DType, decat: bool) -> Column {
+    if ps.len() == 1 && !decat { return Column::with_opt(ps[0].d, ps[0].v); }
+    let any_null = ps.iter().any(|p| !(p.v is none));
+    let v = Bitmap { words: List::new(), len: 0 };
+    if any_null {
+        for p in ps {
+            match p.v {
+                m: Bitmap => for i in 0..p.n { v.push(m.get(i)); },
+                none => for _ in 0..p.n { v.push(true); },
+            }
+        }
+    }
+    let valid: Bitmap | none = if any_null { v } else { none };
+    if decat {
+        let xs: List<str> = List::new();
+        for p in ps {
+            if let Data::Cat(c, lv) = p.d {
+                for k in c {
+                    xs.push(lv[k as usize]);
+                }
+            }
+        }
+        return Column::with_opt(Data::Str(xs), valid);
+    }
+    let d = match t {
+        DType::I64 => Data::I64(join(ps, |d: Data| -> List<i64> { if let Data::I64(x) = d { x } else { List::new() } })),
+        DType::F64 => Data::F64(join(ps, |d: Data| -> List<f64> { if let Data::F64(x) = d { x } else { List::new() } })),
+        DType::Bool => Data::Bool(join(ps, |d: Data| -> List<bool> { if let Data::Bool(x) = d { x } else { List::new() } })),
+        DType::Str => Data::Str(join(ps, |d: Data| -> List<str> { if let Data::Str(x) = d { x } else { List::new() } })),
+        DType::Cat => {
+            let lv = if ps.is_empty() { List::new() } else if let Data::Cat(_, l) = ps[0].d { l } else { List::new() };
+            Data::Cat(join(ps, |d: Data| -> List<u32> { if let Data::Cat(x, _) = d { x } else { List::new() } }), lv)
+        },
+        DType::Date => Data::Date(join(ps, |d: Data| -> List<i32> { if let Data::Date(x) = d { x } else { List::new() } })),
+        DType::DateTime => Data::DateTime(join(ps, |d: Data| -> List<i64> { if let Data::DateTime(x) = d { x } else { List::new() } })),
+    };
+    Column::with_opt(d, valid)
+}
+
+fn join<T>(ps: List<Piece>, f: fn(Data) -> List<T>) -> List<T> {
+    let n = 0usize;
+    for p in ps {
+        n += p.n;
+    }
+    let out: List<T> = List::with_capacity(n);
+    for p in ps {
+        for x in f(p.d) {
+            out.push(x);
+        }
+    }
+    out
+}
+
+fn is_file(b: List<u8>) -> bool {
+    b.len() >= 8 && b[0] == 65u8 && b[1] == 82u8 && b[2] == 82u8 && b[3] == 79u8 && b[4] == 87u8 && b[5] == 49u8
+}
+
+/// The footer table of a file.
+fn footer(b: List<u8>) throws (TableError) -> usize {
+    let n = b.len();
+    if n < 18 { throw fail("the file is too short for an Arrow file"); }
+    let len = i32_at(b, n - 10);
+    if len <= 0 || len as usize + 18 > n { throw fail("the footer length is wrong; the file may be cut short"); }
+    try root(b, n - 10 - len as usize)
+}
+
+/// The fields of the encapsulated schema message in `b`.
+pub(pkg) fn message_fields(b: List<u8>) throws (TableError) -> List<Fld> {
+    let m = try message(b, 0) ?? throw fail("no schema message");
+    if m.kind != 1u64 { throw fail("not a schema message"); }
+    try fields(b, m.header)
+}
+
+/// The fields of the data's schema.
+pub(pkg) fn schema_fields(b: List<u8>) throws (TableError) -> List<Fld> {
+    if is_file(b) {
+        let ft = try footer(b);
+        let s = try get_table(b, ft, 1) ?? throw fail("the footer has no schema");
+        return try fields(b, s);
+    }
+    let m = try message(b, 0) ?? throw fail("the stream is empty; it has no schema message");
+    if m.kind != 1u64 { throw fail("the stream does not start with a schema message"); }
+    try fields(b, m.header)
+}
+
+/// The table's schema without reading its batches.
+pub(pkg) fn schema(b: List<u8>) throws (TableError) -> Schema {
+    let fs = try schema_fields(b);
+    let out: List<Field> = List::new();
+    for f in fs {
+        out.push(Field { name: f.name, dtype: try dtype(f) });
+    }
+    Schema { fields: out }
+}
+
+/// The table in `b` (file or stream format), only `cols` when given.
+pub(pkg) fn read(b: List<u8>, cols: List<str> | none) throws (TableError) -> Table {
+    let fs = try schema_fields(b);
+    let r = try reader(b, fs, cols);
+    if is_file(b) {
+        let ft = try footer(b);
+        let (d0, nd) = try get_vec(b, ft, 2, 24);
+        for i in 0..nd {
+            let m = try message(b, i64_at(b, d0 + 24 * i) as usize) ?? throw fail("a dictionary block points at no message");
+            try on_dict(b, ref r, m);
+        }
+        let (r0, nr) = try get_vec(b, ft, 3, 24);
+        for i in 0..nr {
+            let off = i64_at(b, r0 + 24 * i);
+            if off < 0 { throw fail("a record batch block has a negative offset"); }
+            let m = try message(b, off as usize) ?? throw fail("a record batch block points at no message");
+            if m.kind != 3u64 { throw fail("a record batch block points at another kind of message"); }
+            try on_batch(b, ref r, m);
+        }
+    } else {
+        let m = try message(b, 0) ?? throw fail("the stream is empty");
+        let p = m.next;
+        loop {
+            let next = try message(b, p);
+            let m = next ?? break;
+            if m.kind == 2u64 {
+                try on_dict(b, ref r, m);
+            } else if m.kind == 3u64 {
+                try on_batch(b, ref r, m);
+            } else {
+                throw fail(f"message kind {m.kind} in the stream; only dictionary and record batches follow the schema");
+            }
+            p = m.next;
+        }
+    }
+    try done(r)
+}

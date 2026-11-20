@@ -1,0 +1,168 @@
+//! One cell, the element type of rows and the scalar of expressions.
+
+use pkg::{Date, DateTime, DType};
+
+/// A single cell. A categorical cell reads as `Str`.
+///
+/// ```nabi
+/// let v = table::Value::from(2.5);
+/// assert(v.as_f64() == 2.5);
+/// assert(f"{table::Value::Null}" == "null");
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum Value {
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(str),
+    Date(Date),
+    DateTime(DateTime),
+}
+
+impl Value {
+    /// `true` for `Null`.
+    pub fn is_null(self) -> bool { self is Value::Null }
+
+    /// The type of a non-null value; `none` for `Null`.
+    pub fn dtype(self) -> DType | none {
+        match self {
+            Value::Null => none,
+            Value::Int(_) => DType::I64,
+            Value::Float(_) => DType::F64,
+            Value::Bool(_) => DType::Bool,
+            Value::Str(_) => DType::Str,
+            Value::Date(_) => DType::Date,
+            Value::DateTime(_) => DType::DateTime,
+        }
+    }
+
+    /// The integer, `none` for another kind.
+    pub fn as_i64(self) -> i64 | none {
+        match self {
+            Value::Int(n) => n,
+            _ => none,
+        }
+    }
+
+    /// A number as `f64` (an `Int` converts).
+    pub fn as_f64(self) -> f64 | none {
+        match self {
+            Value::Int(n) => n as f64,
+            Value::Float(x) => x,
+            _ => none,
+        }
+    }
+
+    /// The bool, `none` for another kind.
+    pub fn as_bool(self) -> bool | none {
+        match self {
+            Value::Bool(b) => b,
+            _ => none,
+        }
+    }
+
+    /// The text, `none` for another kind.
+    pub fn as_str(self) -> str | none {
+        match self {
+            Value::Str(s) => s,
+            _ => none,
+        }
+    }
+
+    /// The date, `none` for another kind.
+    pub fn as_date(self) -> Date | none {
+        match self {
+            Value::Date(d) => d,
+            _ => none,
+        }
+    }
+
+    /// The timestamp, `none` for another kind.
+    pub fn as_datetime(self) -> DateTime | none {
+        match self {
+            Value::DateTime(t) => t,
+            _ => none,
+        }
+    }
+
+    /// Total order for sorting: numbers by value (`Int` and `Float`
+    /// compare as numbers, NaN last), then the other kinds; `Null`
+    /// first. Mixed kinds order by kind.
+    pub fn total_cmp(self, other: Value) -> Ordering {
+        match (self, other) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Str(a), Value::Str(b)) => a.cmp(b),
+            (Value::Date(a), Value::Date(b)) => a.cmp(b),
+            (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
+            _ => {
+                let x = self.as_f64();
+                let y = other.as_f64();
+                if let a: f64 = x {
+                    if let b: f64 = y { return a.total_cmp(b); }
+                }
+                self.rank().cmp(other.rank())
+            },
+        }
+    }
+
+    fn rank(self) -> i32 {
+        match self {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) => 2,
+            Value::Float(_) => 2,
+            Value::Str(_) => 3,
+            Value::Date(_) => 4,
+            Value::DateTime(_) => 5,
+        }
+    }
+}
+
+/// `null`, numbers as Nabi prints them, strings bare.
+impl Display for Value {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            Value::Null => "null",
+            Value::Int(n) => f"{n}",
+            Value::Float(x) => f"{x}",
+            Value::Bool(b) => f"{b}",
+            Value::Str(s) => s,
+            Value::Date(d) => f"{d}",
+            Value::DateTime(t) => f"{t}",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(x: i64) -> Value { Value::Int(x) }
+}
+
+impl From<i32> for Value {
+    fn from(x: i32) -> Value { Value::Int(x as i64) }
+}
+
+impl From<f64> for Value {
+    fn from(x: f64) -> Value { Value::Float(x) }
+}
+
+impl From<bool> for Value {
+    fn from(x: bool) -> Value { Value::Bool(x) }
+}
+
+impl From<str> for Value {
+    fn from(x: str) -> Value { Value::Str(x) }
+}
+
+impl From<Date> for Value {
+    fn from(x: Date) -> Value { Value::Date(x) }
+}
+
+impl From<DateTime> for Value {
+    fn from(x: DateTime) -> Value { Value::DateTime(x) }
+}

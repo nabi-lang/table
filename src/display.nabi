@@ -1,0 +1,161 @@
+//! Text forms of a table: the aligned preview `Display` prints (rows
+//! and columns cut in the middle past a limit) and GitHub-flavoured
+//! Markdown.
+
+use pkg::{Column, Table, Value};
+
+/// Rows `Display` shows before cutting (half from each end).
+pub const MAX_ROWS: usize = 10;
+/// Columns `Display` shows before cutting.
+pub const MAX_COLS: usize = 8;
+/// Code points of a cell before it is cut with `...`.
+pub const MAX_WIDTH: usize = 24;
+
+fn cell_text(c: Column, i: usize) -> str {
+    let v = c.get(i);
+    match v {
+        Value::Null => "null",
+        Value::Float(x) => fmt_f64(x),
+        _ => f"{v}",
+    }
+}
+
+/// Short float text: up to 6 decimals, trailing zeros dropped down to
+/// one (`3.0`, `0.25`); exponent form outside 1e-4..1e15.
+fn fmt_f64(x: f64) -> str {
+    if !x.is_finite() { return f"{x}"; }
+    if x == x.trunc() && x.abs() < 1e15 { return f"{x:.1}"; }
+    let a = x.abs();
+    if a >= 1e-4 && a < 1e15 {
+        let s = f"{x:.6}";
+        let t = s.trim_end_matches("0");
+        return if t.ends_with(".") { t + "0" } else { t };
+    }
+    f"{x:e}"
+}
+
+fn clip(s: str, w: usize) -> str {
+    if s.chars().count() <= w { return s; }
+    let out: str = s.chars().take(w - 3).collect();
+    out + "..."
+}
+
+fn pad(s: str, w: usize, right: bool) -> str {
+    let n = s.chars().count();
+    if n >= w { return s; }
+    let fill = " ".repeat(w - n);
+    if right { fill + s } else { s + fill }
+}
+
+impl Table {
+    /// The preview with at most `max_rows` rows and `max_cols` columns
+    /// (the middle cut, marked `...`), the shape on the first line and
+    /// each column's type under its name.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "a": [1, 2, 3], "b": ["x", "y", "z"] };
+    /// let s = t.preview(2, 8);
+    /// assert(s.starts_with("shape: (3, 2)"));
+    /// assert(s.contains("..."));
+    /// ```
+    pub fn preview(self, max_rows: usize, max_cols: usize) -> str {
+        let nr = self.rows;
+        let nc = self.cols.len();
+        let rows: List<i64> = List::new();
+        if nr <= max_rows {
+            for i in 0..nr { rows.push(i as i64); }
+        } else {
+            let top = (max_rows + 1) / 2;
+            for i in 0..top { rows.push(i as i64); }
+            rows.push(-1);
+            for i in nr - (max_rows - top)..nr { rows.push(i as i64); }
+        }
+        let cols: List<i64> = List::new();
+        if nc <= max_cols {
+            for k in 0..nc { cols.push(k as i64); }
+        } else {
+            let left = (max_cols + 1) / 2;
+            for k in 0..left { cols.push(k as i64); }
+            cols.push(-1);
+            for k in nc - (max_cols - left)..nc { cols.push(k as i64); }
+        }
+        // Text of every shown cell, per column, then the widths.
+        let grid: List<List<str>> = List::new();
+        let right: List<bool> = List::new();
+        for k in cols {
+            let col: List<str> = List::new();
+            if k < 0 {
+                col.push("...");
+                col.push("");
+                for _ in rows { col.push("..."); }
+                right.push(false);
+            } else {
+                let c = self.cols[k as usize];
+                col.push(clip(self.names[k as usize], MAX_WIDTH));
+                col.push(c.dtype().name());
+                for i in rows { col.push(if i < 0 { "..." } else { clip(cell_text(c, i as usize), MAX_WIDTH) }); }
+                right.push(c.dtype().is_numeric());
+            }
+            grid.push(col);
+        }
+        let widths: List<usize> = grid.iter().map(|col| col.iter().map(|s| s.chars().count()).fold(1usize, |a, b| a.max(b))).collect();
+        let out = StrBuf::new();
+        out.push_str(f"shape: ({nr}, {nc})\n");
+        let lines = rows.len() + 2;
+        for line in 0..lines {
+            let parts: List<str> = List::new();
+            for j in 0..grid.len() {
+                parts.push(pad(grid[j][line], widths[j], right[j] && line > 1));
+            }
+            out.push_str(parts.join(" | ").trim_end());
+            out.push_str("\n");
+            if line == 1 {
+                let dashes: List<str> = widths.iter().map(|w| "-".repeat(w)).collect();
+                out.push_str(dashes.join("-+-"));
+                out.push_str("\n");
+            }
+        }
+        out.to_str().trim_end_matches("\n")
+    }
+
+    /// The whole table as a GitHub-flavoured Markdown table: numbers
+    /// right-aligned, `|` in a cell escaped, null as an empty cell.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "name": ["a|b"], "n": [1] };
+    /// assert(t.to_markdown() == "| name | n |\n| :--- | ---: |\n| a\\|b | 1 |\n");
+    /// ```
+    pub fn to_markdown(self) -> str {
+        let out = StrBuf::new();
+        let head: List<str> = self.names.iter().map(|n| esc(n)).collect();
+        out.push_str(f"| {head.join(" | ")} |\n");
+        let rule: List<str> = self.cols.iter().map(|c| if c.dtype().is_numeric() { "---:" } else { ":---" }).collect();
+        out.push_str(f"| {rule.join(" | ")} |\n");
+        for i in 0..self.rows {
+            let cells: List<str> = self.cols.iter().map(|c| if c.is_null(i) { "" } else { esc(cell_text(c, i)) }).collect();
+            out.push_str(f"| {cells.join(" | ")} |\n");
+        }
+        out.to_str()
+    }
+}
+
+fn esc(s: str) -> str { s.replace("|", "\\|").replace("\n", " ") }
+
+/// The preview with the default limits (`MAX_ROWS`, `MAX_COLS`).
+impl Display for Table {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.preview(MAX_ROWS, MAX_COLS)) }
+}
+
+impl Debug for Table {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.preview(MAX_ROWS, MAX_COLS)) }
+}
+
+impl Display for Column {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let n = self.len();
+        let shown: List<str> = List::new();
+        for i in 0..n.min(MAX_ROWS) { shown.push(cell_text(self, i)); }
+        if n > MAX_ROWS { shown.push("..."); }
+        try f.write_str(f"[{shown.join(", ")}] ({n} x {self.dtype()})")
+    }
+}

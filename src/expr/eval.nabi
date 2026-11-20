@@ -1,0 +1,562 @@
+// Evaluating an expression: one pass per node over whole columns. A
+// scalar stays a scalar until it meets a column, so `col("x") .* 2`
+// never builds a column of 2s.
+
+use pkg::column::bitmap::Bitmap;
+use pkg::column::{Data, mapl};
+use pkg::expr::window;
+use pkg::expr::{Cum, Fun, Node, Op, Roll, TextOp};
+use pkg::frame::fill;
+use pkg::{Column, Date, DateTime, DType, Expr, Table, TableError, Value};
+
+/// A node's value: a column of the table's length, or one scalar.
+#[derive(Clone)]
+pub(pkg) enum Out {
+    C(Column),
+    S(Value),
+}
+
+/// A numeric operand.
+#[derive(Clone)]
+enum Num {
+    I(List<i64>),
+    F(List<f64>),
+    SI(i64),
+    SF(f64),
+}
+
+impl Expr {
+    /// The expression's values over `t`, as a column of `t.nrows()` rows.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1, 2] };
+    /// let c = try (table::col("x") .* 10).eval(t) catch _ { table::Column::i64s([]) };
+    /// assert(c.get(1) == table::Value::Int(20));
+    /// ```
+    pub fn eval(self, t: Table) throws (TableError) -> Column {
+        match try ev(self, t) {
+            Out::C(c) => c,
+            Out::S(v) => broadcast(v, t.rows),
+        }
+    }
+}
+
+/// `n` copies of `v` as a column.
+pub(pkg) fn broadcast(v: Value, n: usize) -> Column {
+    match v {
+        Value::Null => Column::nulls(DType::F64, n),
+        Value::Int(x) => Column::of(Data::I64(List::filled(n, x))),
+        Value::Float(x) => Column::of(Data::F64(List::filled(n, x))),
+        Value::Bool(x) => Column::of(Data::Bool(List::filled(n, x))),
+        Value::Str(x) => Column::of(Data::Str(List::filled(n, x))),
+        Value::Date(x) => Column::of(Data::Date(List::filled(n, x.days))),
+        Value::DateTime(x) => Column::of(Data::DateTime(List::filled(n, x.ns))),
+    }
+}
+
+fn col_of(o: Out, n: usize) -> Column {
+    match o {
+        Out::C(c) => c,
+        Out::S(v) => broadcast(v, n),
+    }
+}
+
+/// The validity of both: a row is valid when it is in each.
+fn both(a: Bitmap | none, b: Bitmap | none) -> Bitmap | none {
+    match a {
+        x: Bitmap => match b {
+            y: Bitmap => x.and(y),
+            none => x,
+        },
+        none => b,
+    }
+}
+
+fn valid_of(o: Out) -> Bitmap | none {
+    match o {
+        Out::C(c) => c.valid,
+        Out::S(_) => none,
+    }
+}
+
+pub(pkg) fn ev(e: Expr, t: Table) throws (TableError) -> Out {
+    let n = t.rows;
+    let k = e.kids;
+    match e.node {
+        Node::Col(name) => Out::C(try t.column(name)),
+        Node::Lit(v) => Out::S(v),
+        Node::Bin(op) => {
+            let a = try ev(k[0], t);
+            let b = try ev(k[1], t);
+            try binary(op, a, b, n, e)
+        },
+        Node::Neg => match try ev(k[0], t) {
+            Out::S(v) => Out::S(match v {
+                Value::Int(x) => Value::Int(-x),
+                Value::Float(x) => Value::Float(-x),
+                Value::Null => Value::Null,
+                _ => throw TableError::invalid(f"`-` needs a number, not {v.dtype() ?? DType::Str}: {e}"),
+            }),
+            Out::C(c) => Out::C(match c.data {
+                Data::I64(a) => Column::with_opt(Data::I64(mapl(a, |x| -x)), c.valid),
+                Data::F64(a) => Column::with_opt(Data::F64(mapl(a, |x| -x)), c.valid),
+                _ => throw TableError::invalid(f"`-` needs a number, not {c.dtype()}: {e}"),
+            }),
+        },
+        Node::Not => {
+            let c = col_of(try ev(k[0], t), n);
+            match c.data {
+                Data::Bool(a) => Out::C(Column::with_opt(Data::Bool(mapl(a, |x| !x)), c.valid)),
+                _ => throw TableError::invalid(f"`!` needs bool, not {c.dtype()}: {e}"),
+            }
+        },
+        Node::IsNull => {
+            let c = col_of(try ev(k[0], t), n);
+            Out::C(Column::of(Data::Bool(List::from_fn(n, |i| c.is_null(i)))))
+        },
+        Node::NotNull => {
+            let c = col_of(try ev(k[0], t), n);
+            Out::C(Column::of(Data::Bool(List::from_fn(n, |i| c.is_valid(i)))))
+        },
+        Node::FillNull => {
+            let c = col_of(try ev(k[0], t), n);
+            match try ev(k[1], t) {
+                Out::S(v) => Out::C(try fill(c, v)),
+                Out::C(o) => {
+                    let vs: List<Value> = List::from_fn(n, |i| if c.is_valid(i) { c.get(i) } else { o.get(i) });
+                    Out::C(try Column::from_values(vs, c.dtype()))
+                },
+            }
+        },
+        Node::Cast(dt) => Out::C(try col_of(try ev(k[0], t), n).cast(dt)),
+        Node::IsIn(vs) => {
+            let c = col_of(try ev(k[0], t), n);
+            let set: List<Value> = vs;
+            Out::C(Column::of(Data::Bool(List::from_fn(n, |i| c.is_valid(i) && set.contains(c.get(i))))))
+        },
+        Node::Func(f) => Out::C(try func(f, col_of(try ev(k[0], t), n), e)),
+        Node::Text(op, s) => {
+            let c = col_of(try ev(k[0], t), n);
+            if !c.dtype().is_text() {
+                throw TableError::invalid(f"`{e}` needs text, but the column is {c.dtype()}; cast it with `.cast(DType::Str)`");
+            }
+            let xs = try c.to_strs();
+            let r = match op {
+                TextOp::Contains => mapl(xs, |x| x.contains(s)),
+                TextOp::StartsWith => mapl(xs, |x| x.starts_with(s)),
+                TextOp::EndsWith => mapl(xs, |x| x.ends_with(s)),
+            };
+            Out::C(Column::with_opt(Data::Bool(r), c.valid))
+        },
+        Node::When => {
+            let cond = col_of(try ev(k[0], t), n);
+            let m = match cond.data {
+                Data::Bool(m) => m,
+                _ => throw TableError::invalid(f"`when` needs a bool condition, not {cond.dtype()}"),
+            };
+            let a = col_of(try ev(k[1], t), n);
+            let b = col_of(try ev(k[2], t), n);
+            let vs: List<Value> = List::from_fn(n, |i| if m[i] && cond.is_valid(i) { a.get(i) } else { b.get(i) });
+            let dt = if a.dtype() == b.dtype() { a.dtype() } else if a.dtype().is_numeric() && b.dtype().is_numeric() { DType::F64 } else { a.dtype() };
+            Out::C(try Column::from_values(vs, dt) catch _ {
+                throw TableError::invalid(f"`when` branches are {a.dtype()} and {b.dtype()}; give both one type");
+            })
+        },
+        Node::Cum(op) => Out::C(try window::cumulative(op, col_of(try ev(k[0], t), n))),
+        Node::Roll(op, w, minp) => Out::C(try window::rolling(op, w, minp, col_of(try ev(k[0], t), n))),
+        Node::Shift(s) => {
+            let c = col_of(try ev(k[0], t), n);
+            let idx: List<i64> = List::from_fn(n, |i| {
+                let j = i as i64 - s;
+                if j < 0 || j >= n as i64 { -1 } else { j }
+            });
+            Out::C(c.take_or_null(idx))
+        },
+        Node::Map(f) => {
+            let c = col_of(try ev(k[0], t), n);
+            let vs: List<Value> = List::from_fn(n, |i| f(c.get(i)));
+            Out::C(try Column::from_values(vs, none))
+        },
+        Node::MapF64(f) => {
+            let c = col_of(try ev(k[0], t), n);
+            let xs = try c.f64_list() catch _ { throw TableError::invalid(f"`map_f64` needs numbers, not {c.dtype()}"); };
+            Out::C(Column::with_opt(Data::F64(mapl(xs, f)), c.valid))
+        },
+    }
+}
+
+fn num(o: Out, e: Expr) throws (TableError) -> Num {
+    match o {
+        Out::S(v) => match v {
+            Value::Int(x) => Num::SI(x),
+            Value::Float(x) => Num::SF(x),
+            _ => throw TableError::invalid(f"`{e}` needs numbers, but one side is {v.dtype() ?? DType::Str}"),
+        },
+        Out::C(c) => match c.data {
+            Data::I64(a) => Num::I(a),
+            Data::F64(a) => Num::F(a),
+            _ => throw TableError::invalid(f"`{e}` needs numbers, but one side is {c.dtype()}; cast it with `.cast(DType::F64)`"),
+        },
+    }
+}
+
+fn as_f(x: Num) -> Num {
+    match x {
+        Num::I(a) => Num::F(mapl(a, |v| v as f64)),
+        Num::SI(v) => Num::SF(v as f64),
+        _ => x,
+    }
+}
+
+fn is_int(x: Num) -> bool {
+    match x {
+        Num::I(_) => true,
+        Num::SI(_) => true,
+        _ => false,
+    }
+}
+
+fn binary(op: Op, a: Out, b: Out, n: usize, e: Expr) throws (TableError) -> Out {
+    // A null scalar makes every row null (`.&&` / `.||` aside).
+    if op != Op::And && op != Op::Or {
+        if let Out::S(Value::Null) = a { return Out::S(Value::Null); }
+        if let Out::S(Value::Null) = b { return Out::S(Value::Null); }
+    }
+    if op == Op::And || op == Op::Or {
+        return Out::C(try logical(op, col_of(a, n), col_of(b, n), e));
+    }
+    let valid = both(valid_of(a), valid_of(b));
+    if op.is_cmp() {
+        return try compare(op, a, b, valid, e);
+    }
+    let x = try num(a, e);
+    let y = try num(b, e);
+    let ints = is_int(x) && is_int(y) && op != Op::Div && op != Op::Pow;
+    if ints {
+        return int_arith(op, x, y, valid);
+    }
+    let fx = as_f(x);
+    let fy = as_f(y);
+    let r: Out = match (fx, fy) {
+        (Num::SF(p), Num::SF(q)) => Out::S(Value::Float(fscalar(op, p, q))),
+        (Num::F(p), Num::F(q)) => Out::C(Column::with_opt(Data::F64(match op {
+            Op::Add => p .+ q,
+            Op::Sub => p .- q,
+            Op::Mul => p .* q,
+            Op::Div => p ./ q,
+            Op::Rem => p .% q,
+            _ => p .** q,
+        }), valid)),
+        (Num::F(p), Num::SF(q)) => Out::C(Column::with_opt(Data::F64(match op {
+            Op::Add => p .+ q,
+            Op::Sub => p .- q,
+            Op::Mul => p .* q,
+            Op::Div => p ./ q,
+            Op::Rem => p .% q,
+            _ => p .** q,
+        }), valid)),
+        (Num::SF(p), Num::F(q)) => Out::C(Column::with_opt(Data::F64(match op {
+            Op::Add => p .+ q,
+            Op::Sub => p .- q,
+            Op::Mul => p .* q,
+            Op::Div => p ./ q,
+            Op::Rem => p .% q,
+            _ => p .** q,
+        }), valid)),
+        _ => throw TableError::invalid("internal: float operands"),
+    };
+    r
+}
+
+fn fscalar(op: Op, p: f64, q: f64) -> f64 {
+    match op {
+        Op::Add => p + q,
+        Op::Sub => p - q,
+        Op::Mul => p * q,
+        Op::Div => p / q,
+        Op::Rem => p % q,
+        _ => p ** q,
+    }
+}
+
+/// `i64` arithmetic, wrapping on overflow; `.%` by zero gives null.
+fn int_arith(op: Op, x: Num, y: Num, valid: Bitmap | none) -> Out {
+    if let Num::SI(p) = x {
+        if let Num::SI(q) = y {
+            return Out::S(match op {
+                Op::Add => Value::Int(p.wrapping_add(q)),
+                Op::Sub => Value::Int(p.wrapping_sub(q)),
+                Op::Mul => Value::Int(p.wrapping_mul(q)),
+                _ => if q == 0 { Value::Null } else { Value::Int(p.wrapping_rem(q)) },
+            });
+        }
+    }
+    let n = match x {
+        Num::I(a) => a.len(),
+        _ => match y {
+            Num::I(b) => b.len(),
+            _ => 0,
+        },
+    };
+    let xs: List<i64> = match x {
+        Num::I(a) => a,
+        Num::SI(v) => List::filled(n, v),
+        _ => List::new(),
+    };
+    let ys: List<i64> = match y {
+        Num::I(b) => b,
+        Num::SI(v) => List::filled(n, v),
+        _ => List::new(),
+    };
+    let out: List<i64> = List::with_capacity(n);
+    let zero = false;
+    match op {
+        Op::Add => for i in 0..n { out.push(xs[i].wrapping_add(ys[i])); },
+        Op::Sub => for i in 0..n { out.push(xs[i].wrapping_sub(ys[i])); },
+        Op::Mul => for i in 0..n { out.push(xs[i].wrapping_mul(ys[i])); },
+        _ => for i in 0..n {
+            let q = ys[i];
+            if q == 0 {
+                zero = true;
+                out.push(0);
+            } else {
+                out.push(xs[i].wrapping_rem(q));
+            }
+        },
+    }
+    let v = valid;
+    if zero {
+        let flags: List<bool> = List::from_fn(n, |i| ys[i] != 0);
+        v = both(v, Bitmap::from_flags(flags));
+    }
+    Out::C(Column::with_opt(Data::I64(out), v))
+}
+
+/// Comparison of two numbers, strings, bools, dates or timestamps.
+fn compare(op: Op, a: Out, b: Out, valid: Bitmap | none, e: Expr) throws (TableError) -> Out {
+    let ta = kind(a);
+    let tb = kind(b);
+    if let Out::S(x) = a {
+        if let Out::S(y) = b {
+            return Out::S(Value::Bool(ord_ok(op, x.total_cmp(y))));
+        }
+    }
+    let both_num = ta.is_numeric() && tb.is_numeric();
+    if !both_num && !(ta.is_text() && tb.is_text()) && ta != tb {
+        throw TableError::invalid(f"`{e}` compares {ta} with {tb}; compare like with like (cast one side)");
+    }
+    // A categorical column against a string: compare codes for `==` / `!=`.
+    if op == Op::Eq || op == Op::Ne {
+        if let Out::C(c) = a {
+            if let Data::Cat(codes, lv) = c.data {
+                if let Out::S(Value::Str(s)) = b {
+                    let code: i64 = -1;
+                    for j in 0..lv.len() {
+                        if lv[j] == s {
+                            code = j as i64;
+                            break;
+                        }
+                    }
+                    let want = op == Op::Eq;
+                    let r = mapl(codes, |x| (x as i64 == code) == want);
+                    return Out::C(Column::with_opt(Data::Bool(r), valid));
+                }
+            }
+        }
+    }
+    let r: List<bool> = if both_num && (ta == DType::F64 || tb == DType::F64) {
+        cmp_side(op, fside(a), fside(b))
+    } else if both_num {
+        cmp_side(op, iside(a, |v| v.as_i64() ?? 0), iside(b, |v| v.as_i64() ?? 0))
+    } else if ta.is_text() {
+        cmp_side(op, sside(a), sside(b))
+    } else if ta == DType::Bool {
+        cmp_side(op, bside(a), bside(b))
+    } else if ta == DType::Date {
+        cmp_side(op, iside(a, |v| (v.as_date() ?? Date { days: 0 }).days as i64), iside(b, |v| (v.as_date() ?? Date { days: 0 }).days as i64))
+    } else {
+        cmp_side(op, iside(a, |v| (v.as_datetime() ?? DateTime { ns: 0 }).ns), iside(b, |v| (v.as_datetime() ?? DateTime { ns: 0 }).ns))
+    };
+    Out::C(Column::with_opt(Data::Bool(r), valid))
+}
+
+fn kind(o: Out) -> DType {
+    match o {
+        Out::C(c) => c.dtype(),
+        Out::S(v) => v.dtype() ?? DType::F64,
+    }
+}
+
+fn ord_ok(op: Op, o: Ordering) -> bool {
+    match op {
+        Op::Eq => o.is_eq(),
+        Op::Ne => !o.is_eq(),
+        Op::Lt => o.is_lt(),
+        Op::Le => !o.is_gt(),
+        Op::Gt => o.is_gt(),
+        _ => !o.is_lt(),
+    }
+}
+
+/// One side of a comparison: a list, or one value for every row.
+#[derive(Clone)]
+enum Side<T> {
+    L(List<T>),
+    S(T),
+}
+
+fn fside(o: Out) -> Side<f64> {
+    match o {
+        Out::S(v) => Side::S(v.as_f64() ?? f64::NAN),
+        Out::C(c) => Side::L(match c.data {
+            Data::F64(a) => a,
+            Data::I64(a) => mapl(a, |x| x as f64),
+            _ => List::new(),
+        }),
+    }
+}
+
+fn iside(o: Out, scalar: fn(Value) -> i64) -> Side<i64> {
+    match o {
+        Out::S(v) => Side::S(scalar(v)),
+        Out::C(c) => Side::L(match c.data {
+            Data::I64(a) => a,
+            Data::Date(a) => mapl(a, |x| x as i64),
+            Data::DateTime(a) => a,
+            _ => List::new(),
+        }),
+    }
+}
+
+fn sside(o: Out) -> Side<str> {
+    match o {
+        Out::S(v) => Side::S(v.as_str() ?? ""),
+        Out::C(c) => Side::L(try c.to_strs() catch _ { List::new() }),
+    }
+}
+
+fn bside(o: Out) -> Side<bool> {
+    match o {
+        Out::S(v) => Side::S(v.as_bool() ?? false),
+        Out::C(c) => Side::L(match c.data {
+            Data::Bool(a) => a,
+            _ => List::new(),
+        }),
+    }
+}
+
+fn cmp_side<T: PartialOrd>(op: Op, a: Side<T>, b: Side<T>) -> List<bool> {
+    match a {
+        Side::L(x) => match b {
+            Side::L(y) => match op {
+                Op::Eq => x .== y,
+                Op::Ne => x .!= y,
+                Op::Lt => x .< y,
+                Op::Le => x .<= y,
+                Op::Gt => x .> y,
+                _ => x .>= y,
+            },
+            Side::S(y) => match op {
+                Op::Eq => x .== y,
+                Op::Ne => x .!= y,
+                Op::Lt => x .< y,
+                Op::Le => x .<= y,
+                Op::Gt => x .> y,
+                _ => x .>= y,
+            },
+        },
+        Side::S(x) => match b {
+            Side::L(y) => match op {
+                Op::Eq => y .== x,
+                Op::Ne => y .!= x,
+                Op::Lt => y .> x,
+                Op::Le => y .>= x,
+                Op::Gt => y .< x,
+                _ => y .<= x,
+            },
+            Side::S(_) => List::new(),
+        },
+    }
+}
+
+/// Kleene logic: a known `false` decides `.&&`, a known `true` decides
+/// `.||`, otherwise a null operand gives null.
+fn logical(op: Op, a: Column, b: Column, e: Expr) throws (TableError) -> Column {
+    let x = match a.data {
+        Data::Bool(x) => x,
+        _ => throw TableError::invalid(f"`{e}` needs bool on both sides, not {a.dtype()}; compare first, as in `col(\"x\") .> 0`"),
+    };
+    let y = match b.data {
+        Data::Bool(y) => y,
+        _ => throw TableError::invalid(f"`{e}` needs bool on both sides, not {b.dtype()}; compare first, as in `col(\"x\") .> 0`"),
+    };
+    let and = op == Op::And;
+    let r: List<bool> = if and { x .&& y } else { x .|| y };
+    if a.valid is none && b.valid is none {
+        return Column::of(Data::Bool(r));
+    }
+    let n = r.len();
+    let flags: List<bool> = List::with_capacity(n);
+    for i in 0..n {
+        let va = a.is_valid(i);
+        let vb = b.is_valid(i);
+        let ok = (va && vb) || (and && ((va && !x[i]) || (vb && !y[i]))) || (!and && ((va && x[i]) || (vb && y[i])));
+        flags.push(ok);
+        if ok && !(va && vb) {
+            r[i] = !and;
+        }
+    }
+    Column::with_valid(Data::Bool(r), Bitmap::from_flags(flags))
+}
+
+fn func(f: Fun, c: Column, e: Expr) throws (TableError) -> Column {
+    let dt = c.dtype();
+    if f == Fun::Year || f == Fun::Month || f == Fun::Day || f == Fun::Weekday {
+        let days: List<i64> = match c.data {
+            Data::Date(a) => mapl(a, |d| d as i64),
+            Data::DateTime(a) => mapl(a, |x| x.div_euclid(86400000000000)),
+            _ => throw TableError::invalid(f"`{e}` needs a date or datetime, not {dt}"),
+        };
+        let r = mapl(days, |d| {
+            let x = Date { days: d as i32 };
+            match f {
+                Fun::Year => x.year() as i64,
+                Fun::Month => x.month() as i64,
+                Fun::Day => x.day() as i64,
+                _ => x.weekday() as i64,
+            }
+        });
+        return Column::with_opt(Data::I64(r), c.valid);
+    }
+    if f == Fun::Len || f == Fun::Upper || f == Fun::Lower {
+        if !dt.is_text() {
+            throw TableError::invalid(f"`{e}` needs text, not {dt}");
+        }
+        let xs = try c.to_strs();
+        return match f {
+            Fun::Len => Column::with_opt(Data::I64(mapl(xs, |s| s.chars().count() as i64)), c.valid),
+            Fun::Upper => Column::with_opt(Data::Str(mapl(xs, |s| s.to_uppercase())), c.valid),
+            _ => Column::with_opt(Data::Str(mapl(xs, |s| s.to_lowercase())), c.valid),
+        };
+    }
+    if f == Fun::Abs {
+        if let Data::I64(a) = c.data {
+            return Column::with_opt(Data::I64(mapl(a, |x| x.wrapping_abs())), c.valid);
+        }
+    }
+    if dt == DType::I64 && (f == Fun::Round || f == Fun::Floor || f == Fun::Ceil) {
+        return c;
+    }
+    let xs = try c.f64_list() catch _ { throw TableError::invalid(f"`{e}` needs numbers, not {dt}"); };
+    let r = match f {
+        Fun::Abs => mapl(xs, |x| x.abs()),
+        Fun::Sqrt => mapl(xs, |x| x.sqrt()),
+        Fun::Exp => mapl(xs, |x| x.exp()),
+        Fun::Ln => mapl(xs, |x| x.ln()),
+        Fun::Log10 => mapl(xs, |x| x.log10()),
+        Fun::Round => mapl(xs, |x| x.round()),
+        Fun::Floor => mapl(xs, |x| x.floor()),
+        _ => mapl(xs, |x| x.ceil()),
+    };
+    Column::with_opt(Data::F64(r), c.valid)
+}

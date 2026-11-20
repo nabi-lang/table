@@ -1,0 +1,80 @@
+// Little-endian bytes for the binary formats: appends to a `List<u8>`
+// and bounds-checked reads that throw `TableError::Format`, so a cut or
+// corrupt file is an error, not a panic.
+
+use pkg::TableError;
+
+pub(pkg) fn put_u16(b: List<u8>, v: u64) {
+    b.push(v as u8);
+    b.push((v >> 8u64) as u8);
+}
+
+pub(pkg) fn put_u32(b: List<u8>, v: u64) {
+    b.push(v as u8);
+    b.push((v >> 8u64) as u8);
+    b.push((v >> 16u64) as u8);
+    b.push((v >> 24u64) as u8);
+}
+
+pub(pkg) fn put_u64(b: List<u8>, v: u64) {
+    put_u32(b, v & 0xFFFFFFFFu64);
+    put_u32(b, v >> 32u64);
+}
+
+pub(pkg) fn put_i32(b: List<u8>, v: i64) { put_u32(b, (v as u64) & 0xFFFFFFFFu64); }
+
+pub(pkg) fn put_i64(b: List<u8>, v: i64) { put_u64(b, v as u64); }
+
+pub(pkg) fn put_str(b: List<u8>, s: str) {
+    for x in s.as_bytes() {
+        b.push(x);
+    }
+}
+
+/// Zero bytes up to a multiple of `a`.
+pub(pkg) fn pad(b: List<u8>, a: usize) {
+    while b.len() % a != 0 {
+        b.push(0u8);
+    }
+}
+
+/// Overwrite four bytes at `p`.
+pub(pkg) fn set_u32(b: List<u8>, p: usize, v: u64) {
+    b[p] = v as u8;
+    b[p + 1] = (v >> 8u64) as u8;
+    b[p + 2] = (v >> 16u64) as u8;
+    b[p + 3] = (v >> 24u64) as u8;
+}
+
+pub(pkg) fn bad(format: str, msg: str) -> TableError { TableError::Format { format, msg } }
+
+/// `Format` unless `b[p..p + n]` exists.
+pub(pkg) fn need(b: List<u8>, p: usize, n: usize, format: str) throws (TableError) {
+    if p > b.len() || n > b.len() - p {
+        throw bad(format, f"the data ends early (needs {n} bytes at offset {p}, has {b.len()}); the file is cut short or not this format");
+    }
+}
+
+// Unchecked reads: the caller has called `need` for the range.
+
+pub(pkg) fn u16_at(b: List<u8>, p: usize) -> u64 { (b[p] as u64) | ((b[p + 1] as u64) << 8u64) }
+
+pub(pkg) fn u32_at(b: List<u8>, p: usize) -> u64 {
+    (b[p] as u64) | ((b[p + 1] as u64) << 8u64) | ((b[p + 2] as u64) << 16u64) | ((b[p + 3] as u64) << 24u64)
+}
+
+pub(pkg) fn u64_at(b: List<u8>, p: usize) -> u64 { u32_at(b, p) | (u32_at(b, p + 4) << 32u64) }
+
+pub(pkg) fn i32_at(b: List<u8>, p: usize) -> i64 { (u32_at(b, p) as u32) as i32 as i64 }
+
+pub(pkg) fn i64_at(b: List<u8>, p: usize) -> i64 { u64_at(b, p) as i64 }
+
+pub(pkg) fn f32_at(b: List<u8>, p: usize) -> f64 { f32::from_bits(u32_at(b, p) as u32) as f64 }
+
+pub(pkg) fn f64_at(b: List<u8>, p: usize) -> f64 { f64::from_bits(u64_at(b, p)) }
+
+/// `b[p..p + n]` as UTF-8 text.
+pub(pkg) fn text_at(b: List<u8>, p: usize, n: usize, format: str) throws (TableError) -> str {
+    try need(b, p, n, format);
+    try str::from_utf8(b[p..p + n]) catch _ { throw bad(format, f"a string at offset {p} is not UTF-8; read the column as binary elsewhere or fix the writer"); }
+}

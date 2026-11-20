@@ -1,0 +1,31 @@
+// Dates and datetimes: parts, parsing, arithmetic, the literals.
+
+use pkg::{Date, DateTime};
+
+#[test]
+fn dates() {
+    assert(f"{Date::from_days(0)}" == "1970-01-01");
+    assert(f"{Date::from_days(-1)}" == "1969-12-31");
+    assert(f"{Date::from_days(-719468)}" == "0000-03-01");
+    assert((Date::ymd(2000, 2, 29) ?? Date::from_days(0)).days() == 11016);
+    assert(Date::ymd(1900, 2, 29) is none && Date::ymd(2024, 4, 31) is none && Date::ymd(2024, 0, 1) is none);
+    assert(Date::parse("2024-1-01") is none && Date::parse("2024-01-01x") is none);
+    // Every day for 2000 years round-trips through its parts.
+    let d = Date::from_days(-365 * 1000);
+    for _ in 0..(365 * 2000) {
+        let (y, m, dd) = d.parts();
+        assert((Date::ymd(y, m, dd) ?? Date::from_days(0)) == d);
+        d = d.add_days(1);
+    }
+    let t = datetime"2024-03-10T23:59:59.123456789";
+    assert(t.time() == (23u32, 59u32, 59u32, 123456789u32));
+    assert(f"{t}" == "2024-03-10T23:59:59.123456789");
+    assert(f"{DateTime::from_ns(-1)}" == "1969-12-31T23:59:59.999999999");
+    assert(DateTime::parse("2024-03-10T24:00:00") is none);
+    assert(DateTime::parse("2024-03-10T10:30Z") == DateTime::parse("2024-03-10 10:30:00"));
+    assert(t.since(datetime"2024-03-10T00:00:00").as_secs() == 86399);
+    assert(t.add(Duration::secs(1)).date() == date"2024-03-11");
+    assert(date"2024-03-01".at_midnight() == datetime"2024-03-01T00:00:00");
+    assert(f"{date"2024-03-01":?}" == "date\"2024-03-01\"");
+    assert(Date::from_days(4).weekday() == 0u32);
+}

@@ -1,0 +1,74 @@
+// The codecs: Snappy round trips and a hand-built stream, Zstandard
+// and LZ4 frames made by the reference `zstd` / `lz4` tools.
+
+use pkg::codec::{lz4, snappy, zstd};
+use std::fs;
+
+fn text(n: usize) -> List<u8> {
+    let s = StrBuf::new();
+    for i in 0..n {
+        s.push_str(f"row {i % 97} value {(i * 7919) % 1000} ");
+    }
+    s.to_str().as_bytes().to_list()
+}
+
+fn noise(n: usize) -> List<u8> {
+    let x = 0x9E3779B97F4A7C15u64;
+    let out: List<u8> = List::with_capacity(n);
+    for _ in 0..n {
+        x = x ^ (x << 13u64);
+        x = x ^ (x >> 7u64);
+        x = x ^ (x << 17u64);
+        out.push(x as u8);
+    }
+    out
+}
+
+#[test]
+fn snappy_round_trips() {
+    let empty: List<u8> = List::new();
+    for b in [empty, [7u8], text(10), text(5000), noise(70000), List::filled(200000, 0u8)] {
+        let c = snappy::compress(b, 0, b.len());
+        let d = try! snappy::decompress(c, 0, c.len());
+        assert(d == b, f"{b.len()} bytes");
+    }
+    let t = text(20000);
+    let c = snappy::compress(t, 0, t.len());
+    assert(c.len() * 2 < t.len(), f"{c.len()} of {t.len()}");
+}
+
+#[test]
+fn snappy_stream_by_hand() {
+    // Length 9, literal "abc", copy of 6 at offset 3 (copy-1 tag).
+    let c: List<u8> = [9u8, 8u8, 97u8, 98u8, 99u8, 9u8, 3u8];
+    assert(try! snappy::decompress(c, 0, c.len()) == "abcabcabc".as_bytes().to_list());
+    let bad: List<u8> = [9u8, 8u8, 97u8, 98u8, 99u8, 9u8, 4u8];
+    assert((try? snappy::decompress(bad, 0, bad.len())) is none);
+}
+
+fn file(name: str) -> List<u8> { try fs::read(f"tests/data/{name}") catch e { panic(f"{name}: {e}"); } }
+
+#[test]
+fn zstd_reference_frames() {
+    // text.txt compressed by `zstd -19`, `zstd -1` and `zstd --ultra
+    // -22 --long` (`text.zst`, `text1.zst`, `text22.zst`), and
+    // noise.bin by `zstd -3` (stored blocks).
+    let want = file("text.txt");
+    for name in ["text.zst", "text1.zst", "text22.zst"] {
+        let c = file(name);
+        assert(try! zstd::decompress(c, 0, c.len()) == want, name);
+    }
+    let n = file("noise.bin");
+    let c = file("noise.zst");
+    assert(try! zstd::decompress(c, 0, c.len()) == n);
+    for cut in [3usize, 10, c.len() / 2] {
+        assert((try? zstd::decompress(c, 0, cut)) is none);
+    }
+}
+
+#[test]
+fn lz4_reference_frames() {
+    let want = file("text.txt");
+    let c = file("text.lz4");
+    assert(try! lz4::frame(c, 0, c.len()) == want);
+}

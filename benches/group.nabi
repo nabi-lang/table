@@ -1,0 +1,40 @@
+// group_by + sum over 1e7 rows: 1000 integer keys, 1e5 integer keys,
+// and string keys.
+
+use pkg::{Column, Table, sum};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn data(n: usize, groups: u64) -> Table {
+    let rng = Xoshiro256PlusPlus::seed(1u64);
+    let k: List<i64> = List::from_fn(n, [ref rng] |_| rng.below(groups) as i64);
+    let v: List<f64> = List::from_fn(n, [ref rng] |_| rng.f64());
+    try Table::from_columns([("k", Column::from(k)), ("v", Column::from(v))]) catch e { panic(f"{e}"); }
+}
+
+#[bench]
+fn sum_1e7_by_1e3(b: Bench) {
+    let t = data(10000000, 1000u64);
+    b.iter(|| try (try black_box(t).group_by(["k"])).agg([sum("v")]) catch e { panic(f"{e}"); });
+}
+
+#[bench]
+fn sum_1e7_by_1e5(b: Bench) {
+    let t = data(10000000, 100000u64);
+    b.iter(|| try (try black_box(t).group_by(["k"])).agg([sum("v")]) catch e { panic(f"{e}"); });
+}
+
+#[bench]
+fn sum_1e6_by_str(b: Bench) {
+    let t = data(1000000, 1000u64);
+    let s = try t.cast("k", pkg::DType::Str) catch e { panic(f"{e}"); };
+    b.iter(|| try (try black_box(s).group_by(["k"])).agg([sum("v")]) catch e { panic(f"{e}"); });
+}
+
+#[bench]
+fn sum_1e7_by_two_keys(b: Bench) {
+    let t = data(10000000, 1000u64);
+    let u = try t.with_column("k2", pkg::col("k") .% 7) catch e { panic(f"{e}"); };
+    b.iter(|| try (try black_box(u).group_by(["k", "k2"])).agg([sum("v")]) catch e { panic(f"{e}"); });
+}

@@ -1,0 +1,492 @@
+// Zstandard decompression (RFC 8878): frames of raw, RLE and compressed
+// blocks; Huffman literals (one or four streams, tables carried over);
+// FSE sequences in predefined, RLE, compressed and repeat modes with the
+// repeat-offset history. Dictionaries are not supported, and the
+// content checksum is skipped, not checked. Output goes to one list, so
+// a match may reach back over the whole frame.
+
+use pkg::TableError;
+use pkg::bytes::{bad, u32_at, u64_at};
+
+const FMT: str = "zstd";
+
+fn fail(msg: str) -> TableError { bad(FMT, msg) }
+
+// Literal length and match length codes: baselines and extra bits.
+const LL_BASE: [i64; 36] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+const LL_BITS: [i64; 36] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+const ML_BASE: [i64; 53] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387, 32771, 65539];
+const ML_BITS: [i64; 53] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+// The predefined distributions.
+const LL_DEF: [i64; 36] = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1];
+const ML_DEF: [i64; 53] = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1];
+const OF_DEF: [i64; 29] = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1];
+
+/// `n` bits at bit `q` of the stream `b[s..e]`, bit 0 the lowest of
+/// `b[s]`; bits before the start read as zeros.
+fn bits(b: List<u8>, s: usize, e: usize, q: i64, n: i64) -> u64 {
+    if n <= 0 { return 0u64; }
+    if q < 0 {
+        if n + q <= 0 { return 0u64; }
+        return bits(b, s, e, 0, n + q) << (-q) as u64;
+    }
+    let p = s + (q >> 3) as usize;
+    let v = 0u64;
+    if p + 8 <= e {
+        v = u64_at(b, p);
+    } else {
+        for i in 0..8 {
+            if p + i < e { v = v | ((b[p + i] as u64) << (8 * i) as u64); }
+        }
+    }
+    (v >> (q & 7) as u64) & ((1u64 << n as u64) - 1u64)
+}
+
+/// A backward bit stream: `q` bits remain, read from the top down.
+struct Rev {
+    b: List<u8>;
+    s: usize;
+    e: usize;
+    q: i64;
+}
+
+fn rev(b: List<u8>, s: usize, e: usize) throws (TableError) -> Rev {
+    if e <= s { throw fail("an empty bit stream"); }
+    let last = b[e - 1];
+    if last == 0u8 { throw fail("a bit stream does not end with its marker bit"); }
+    let top = 7 - (last as u32).leading_zeros() as i64 + 24;
+    Rev { b, s, e, q: 8 * (e - s - 1) as i64 + top }
+}
+
+fn read(ref r: Rev, n: i64) -> u64 {
+    r.q -= n;
+    bits(r.b, r.s, r.e, r.q, n)
+}
+
+/// An FSE decoding table.
+struct Fse {
+    sym: List<i64>;
+    nb: List<i64>;
+    base: List<i64>;
+    al: i64;
+}
+
+fn highbit(x: i64) -> i64 { 63 - (x as u64).leading_zeros() as i64 }
+
+fn build(prob: List<i64>, al: i64) throws (TableError) -> Fse {
+    let size = 1i64 << al;
+    let sym: List<i64> = List::filled(size as usize, 0);
+    let next: List<i64> = List::filled(prob.len(), 0);
+    let high = size - 1;
+    for s in 0..prob.len() {
+        if prob[s] == -1 {
+            sym[high as usize] = s as i64;
+            high -= 1;
+            next[s] = 1;
+        } else {
+            next[s] = prob[s];
+        }
+    }
+    let step = (size >> 1) + (size >> 3) + 3;
+    let mask = size - 1;
+    let pos = 0i64;
+    for s in 0..prob.len() {
+        for _ in 0..prob[s].max(0) {
+            sym[pos as usize] = s as i64;
+            pos = (pos + step) & mask;
+            while pos > high {
+                pos = (pos + step) & mask;
+            }
+        }
+    }
+    if pos != 0 { throw fail("an FSE table's probabilities do not fill it"); }
+    let nb: List<i64> = List::filled(size as usize, 0);
+    let base: List<i64> = List::filled(size as usize, 0);
+    for u in 0..size as usize {
+        let s = sym[u] as usize;
+        let x = next[s];
+        next[s] += 1;
+        let k = al - highbit(x);
+        nb[u] = k;
+        base[u] = (x << k) - size;
+    }
+    Fse { sym, nb, base, al }
+}
+
+fn rle(symbol: i64) -> Fse { Fse { sym: [symbol], nb: [0], base: [0], al: 0 } }
+
+/// An FSE table description at `b[p..e]` (forward bits): the table and
+/// the bytes it took.
+fn describe(b: List<u8>, p: usize, e: usize, max_sym: usize, max_al: i64) throws (TableError) -> (Fse, usize) {
+    if p >= e { throw fail("an FSE table description is cut short"); }
+    let al = (b[p] & 15u8) as i64 + 5;
+    if al > max_al { throw fail(f"an FSE accuracy of {al} above the limit {max_al}"); }
+    let q = 4i64;
+    let remaining = (1i64 << al) + 1;
+    let threshold = 1i64 << al;
+    let nbits = al + 1;
+    let prob: List<i64> = List::new();
+    while remaining > 1 {
+        if prob.len() > max_sym { throw fail("an FSE table has too many symbols"); }
+        if p + (q >> 3) as usize >= e { throw fail("an FSE table description is cut short"); }
+        let max = 2 * threshold - 1 - remaining;
+        let v = bits(b, p, e, q, nbits - 1) as i64;
+        if v < max {
+            q += nbits - 1;
+        } else {
+            v = bits(b, p, e, q, nbits) as i64;
+            if v >= threshold { v -= max; }
+            q += nbits;
+        }
+        let count = v - 1;
+        remaining -= count.abs();
+        prob.push(count);
+        if count == 0 {
+            loop {
+                let r = bits(b, p, e, q, 2) as i64;
+                q += 2;
+                for _ in 0..r {
+                    prob.push(0);
+                }
+                if r != 3 { break; }
+            }
+        }
+        while remaining < threshold && nbits > 1 {
+            nbits -= 1;
+            threshold = threshold >> 1;
+        }
+    }
+    if remaining != 1 || prob.len() > max_sym + 1 { throw fail("an FSE table's probabilities do not add up"); }
+    let used = ((q + 7) >> 3) as usize;
+    if p + used > e { throw fail("an FSE table description is cut short"); }
+    (try build(prob, al), used)
+}
+
+/// A Huffman decoding table: per `2^bits` entry its symbol and length.
+struct Huf {
+    sym: List<u8>;
+    len: List<i64>;
+    bits: i64;
+}
+
+fn huf_table(w: List<i64>) throws (TableError) -> Huf {
+    let total = 0i64;
+    for x in w {
+        if x > 11 { throw fail("a Huffman weight above 11"); }
+        if x > 0 { total += 1i64 << (x - 1); }
+    }
+    if total == 0 { throw fail("a Huffman table with no weights"); }
+    let mb = highbit(total) + 1;
+    let rest = (1i64 << mb) - total;
+    if rest & (rest - 1) != 0 { throw fail("Huffman weights that do not complete a tree"); }
+    w.push(highbit(rest) + 1);
+    if mb > 11 { throw fail("a Huffman code longer than 11 bits"); }
+    let size = 1usize << mb as usize;
+    let sym: List<u8> = List::filled(size, 0u8);
+    let len: List<i64> = List::filled(size, 0);
+    let at = 0usize;
+    for wt in 1..mb + 1 {
+        for s in 0..w.len() {
+            if w[s] != wt { continue; }
+            let n = 1usize << (wt - 1) as usize;
+            for k in at..at + n {
+                sym[k] = s as u8;
+                len[k] = mb + 1 - wt;
+            }
+            at += n;
+        }
+    }
+    Huf { sym, len, bits: mb }
+}
+
+/// The Huffman tree description at `b[p..e]`: the table and its bytes.
+fn huf_describe(b: List<u8>, p: usize, e: usize) throws (TableError) -> (Huf, usize) {
+    if p >= e { throw fail("a Huffman tree description is cut short"); }
+    let h = b[p] as usize;
+    let w: List<i64> = List::new();
+    if h >= 128 {
+        let n = h - 127;
+        let nbytes = (n + 1) / 2;
+        if p + 1 + nbytes > e { throw fail("Huffman weights are cut short"); }
+        for i in 0..n {
+            let byte = b[p + 1 + i / 2];
+            w.push(if i % 2 == 0 { (byte >> 4u8) as i64 } else { (byte & 15u8) as i64 });
+        }
+        return (try huf_table(w), 1 + nbytes);
+    }
+    if p + 1 + h > e { throw fail("Huffman weights are cut short"); }
+    let (t, used) = try describe(b, p + 1, p + 1 + h, 255, 6);
+    let r = try rev(b, p + 1 + used, p + 1 + h);
+    let s1 = read(ref r, t.al) as i64;
+    let s2 = read(ref r, t.al) as i64;
+    loop {
+        if w.len() > 255 { throw fail("too many Huffman weights"); }
+        w.push(t.sym[s1 as usize]);
+        s1 = t.base[s1 as usize] + read(ref r, t.nb[s1 as usize]) as i64;
+        if r.q < 0 {
+            w.push(t.sym[s2 as usize]);
+            break;
+        }
+        w.push(t.sym[s2 as usize]);
+        s2 = t.base[s2 as usize] + read(ref r, t.nb[s2 as usize]) as i64;
+        if r.q < 0 {
+            w.push(t.sym[s1 as usize]);
+            break;
+        }
+    }
+    (try huf_table(w), 1 + h)
+}
+
+fn huf_stream(h: Huf, b: List<u8>, s: usize, e: usize, n: usize, out: List<u8>) throws (TableError) {
+    let r = try rev(b, s, e);
+    let mb = h.bits;
+    for _ in 0..n {
+        let k = bits(b, s, e, r.q - mb, mb) as usize;
+        out.push(h.sym[k]);
+        r.q -= h.len[k];
+    }
+    if r.q != 0 { throw fail("a Huffman stream does not end where its symbols do"); }
+}
+
+/// The decoder state carried between blocks of a frame.
+struct State {
+    huf: Huf | none;
+    ll: Fse | none;
+    of: Fse | none;
+    ml: Fse | none;
+    rep: List<i64>;
+}
+
+fn literals(b: List<u8>, p: usize, e: usize, ref st: State) throws (TableError) -> (List<u8>, usize) {
+    if p >= e { throw fail("a block has no literals section"); }
+    let b0 = b[p] as usize;
+    let kind = b0 & 3;
+    let fmt = (b0 >> 2) & 3;
+    if kind < 2 {
+        let (n, hs) = if fmt == 0 || fmt == 2 {
+            (b0 >> 3, 1usize)
+        } else if fmt == 1 {
+            if p + 2 > e { throw fail("a literals header is cut short"); }
+            ((b0 >> 4) + ((b[p + 1] as usize) << 4), 2)
+        } else {
+            if p + 3 > e { throw fail("a literals header is cut short"); }
+            ((b0 >> 4) + ((b[p + 1] as usize) << 4) + ((b[p + 2] as usize) << 12), 3)
+        };
+        let q = p + hs;
+        if kind == 0 {
+            if q + n > e { throw fail("raw literals are cut short"); }
+            return (b[q:q + n].to_list(), hs + n);
+        }
+        if q >= e { throw fail("RLE literals are cut short"); }
+        return (List::filled(n, b[q]), hs + 1);
+    }
+    let hs = if fmt < 2 { 3usize } else if fmt == 2 { 4 } else { 5 };
+    if p + hs > e { throw fail("a literals header is cut short"); }
+    let hv = 0u64;
+    for i in 0..hs {
+        hv = hv | ((b[p + i] as u64) << (8 * i) as u64);
+    }
+    let w = if fmt < 2 { 10u64 } else if fmt == 2 { 14 } else { 18 };
+    let mask = (1u64 << w) - 1u64;
+    let regen = ((hv >> 4u64) & mask) as usize;
+    let comp = ((hv >> (4u64 + w)) & mask) as usize;
+    let streams = if fmt == 0 { 1 } else { 4 };
+    let q = p + hs;
+    if q + comp > e { throw fail("compressed literals are cut short"); }
+    let end = q + comp;
+    if kind == 2 {
+        let (h, used) = try huf_describe(b, q, end);
+        st.huf = h;
+        q += used;
+    }
+    let h = st.huf ?? throw fail("treeless literals before any Huffman table");
+    let out: List<u8> = List::with_capacity(regen);
+    if streams == 1 {
+        try huf_stream(h, b, q, end, regen, out);
+    } else {
+        if q + 6 > end { throw fail("a literals jump table is cut short"); }
+        let s1 = (b[q] as usize) | ((b[q + 1] as usize) << 8);
+        let s2 = (b[q + 2] as usize) | ((b[q + 3] as usize) << 8);
+        let s3 = (b[q + 4] as usize) | ((b[q + 5] as usize) << 8);
+        let a = q + 6;
+        if a + s1 + s2 + s3 > end { throw fail("literal streams run past their section"); }
+        let per = (regen + 3) / 4;
+        if 3 * per > regen { throw fail("too few literals for four streams"); }
+        try huf_stream(h, b, a, a + s1, per, out);
+        try huf_stream(h, b, a + s1, a + s1 + s2, per, out);
+        try huf_stream(h, b, a + s1 + s2, a + s1 + s2 + s3, per, out);
+        try huf_stream(h, b, a + s1 + s2 + s3, end, regen - 3 * per, out);
+    }
+    (out, hs + comp)
+}
+
+fn mode(b: List<u8>, p: usize, e: usize, m: usize, def: List<i64>, defal: i64, max_sym: usize, max_al: i64, prev: Fse | none) throws (TableError) -> (Fse, usize) {
+    match m {
+        0 => (try build(def, defal), 0usize),
+        1 => {
+            if p >= e { throw fail("an RLE sequence table is cut short"); }
+            (rle(b[p] as i64), 1)
+        },
+        2 => try describe(b, p, e, max_sym, max_al),
+        _ => ((prev ?? throw fail("a repeated sequence table before any table")), 0),
+    }
+}
+
+fn sequences(b: List<u8>, p: usize, e: usize, lits: List<u8>, out: List<u8>, ref st: State) throws (TableError) {
+    if p >= e {
+        for x in lits {
+            out.push(x);
+        }
+        return;
+    }
+    let b0 = b[p] as usize;
+    let q = p + 1;
+    let n = b0;
+    if b0 >= 128 && b0 < 255 {
+        if q >= e { throw fail("a sequence count is cut short"); }
+        n = ((b0 - 128) << 8) + b[q] as usize;
+        q += 1;
+    } else if b0 == 255 {
+        if q + 2 > e { throw fail("a sequence count is cut short"); }
+        n = b[q] as usize + ((b[q + 1] as usize) << 8) + 0x7F00;
+        q += 2;
+    }
+    if n == 0 {
+        for x in lits {
+            out.push(x);
+        }
+        return;
+    }
+    if q >= e { throw fail("the sequence modes are cut short"); }
+    let modes = b[q] as usize;
+    q += 1;
+    let (ll, u1) = try mode(b, q, e, modes >> 6, LL_DEF.to_list(), 6, 35, 9, st.ll);
+    q += u1;
+    let (of, u2) = try mode(b, q, e, (modes >> 4) & 3, OF_DEF.to_list(), 5, 31, 8, st.of);
+    q += u2;
+    let (ml, u3) = try mode(b, q, e, (modes >> 2) & 3, ML_DEF.to_list(), 6, 52, 9, st.ml);
+    q += u3;
+    st.ll = ll;
+    st.of = of;
+    st.ml = ml;
+    let r = try rev(b, q, e);
+    let sl = read(ref r, ll.al) as usize;
+    let so = read(ref r, of.al) as usize;
+    let sm = read(ref r, ml.al) as usize;
+    let lp = 0usize;
+    let rep = st.rep;
+    for i in 0..n {
+        let oc = of.sym[so];
+        let mc = ml.sym[sm] as usize;
+        let lc = ll.sym[sl] as usize;
+        if oc > 31 || mc > 52 || lc > 35 { throw fail("a sequence code is out of range"); }
+        let ov = (1i64 << oc) + read(ref r, oc) as i64;
+        let mlen = ML_BASE[mc] + read(ref r, ML_BITS[mc]) as i64;
+        let llen = LL_BASE[lc] + read(ref r, LL_BITS[lc]) as i64;
+        let off = 0i64;
+        if ov > 3 {
+            off = ov - 3;
+            rep[2] = rep[1];
+            rep[1] = rep[0];
+            rep[0] = off;
+        } else {
+            let k = ov - 1 + if llen == 0 { 1 } else { 0 };
+            if k == 0 {
+                off = rep[0];
+            } else {
+                off = if k == 3 { rep[0] - 1 } else { rep[k as usize] };
+                if k > 1 { rep[2] = rep[1]; }
+                rep[1] = rep[0];
+                rep[0] = off;
+            }
+        }
+        if i + 1 < n {
+            sl = (ll.base[sl] + read(ref r, ll.nb[sl]) as i64) as usize;
+            sm = (ml.base[sm] + read(ref r, ml.nb[sm]) as i64) as usize;
+            so = (of.base[so] + read(ref r, of.nb[so]) as i64) as usize;
+        }
+        let ln = llen as usize;
+        if lp + ln > lits.len() { throw fail("a sequence takes more literals than the block has"); }
+        for k in lp..lp + ln {
+            out.push(lits[k]);
+        }
+        lp += ln;
+        if off <= 0 || off as usize > out.len() { throw fail("a match reaches before the start of the data"); }
+        let from = out.len() - off as usize;
+        for k in 0..mlen as usize {
+            out.push(out[from + k]);
+        }
+    }
+    if r.q != 0 { throw fail("the sequence stream does not end where its sequences do"); }
+    for k in lp..lits.len() {
+        out.push(lits[k]);
+    }
+}
+
+/// `b[s..e]` decompressed: one or more frames (skippable frames are
+/// skipped).
+pub(pkg) fn decompress(b: List<u8>, s: usize, e: usize) throws (TableError) -> List<u8> {
+    let out: List<u8> = List::new();
+    let p = s;
+    while p < e {
+        if p + 4 > e { throw fail("a frame is cut short"); }
+        let magic = u32_at(b, p);
+        if magic & 0xFFFFFFF0u64 == 0x184D2A50u64 {
+            if p + 8 > e { throw fail("a skippable frame is cut short"); }
+            p += 8 + u32_at(b, p + 4) as usize;
+            continue;
+        }
+        if magic != 0xFD2FB528u64 { throw fail("not Zstandard data (bad magic number)"); }
+        p += 4;
+        if p >= e { throw fail("a frame header is cut short"); }
+        let fhd = b[p] as usize;
+        p += 1;
+        let single = (fhd >> 5) & 1 == 1;
+        let fcs = fhd >> 6;
+        let did = fhd & 3;
+        let checksum = (fhd >> 2) & 1 == 1;
+        if !single { p += 1; }
+        let dsize = if did == 3 { 4usize } else { did };
+        if p + dsize > e { throw fail("a frame header is cut short"); }
+        for i in 0..dsize {
+            if b[p + i] != 0u8 { throw fail("the data needs a dictionary; compress it without one"); }
+        }
+        p += dsize;
+        let fsize = if fcs == 0 { if single { 1usize } else { 0 } } else if fcs == 1 { 2 } else if fcs == 2 { 4 } else { 8 };
+        p += fsize;
+        let st = State { huf: none, ll: none, of: none, ml: none, rep: [1, 4, 8] };
+        loop {
+            if p + 3 > e { throw fail("a block header is cut short"); }
+            let h = (b[p] as usize) | ((b[p + 1] as usize) << 8) | ((b[p + 2] as usize) << 16);
+            p += 3;
+            let last = h & 1 == 1;
+            let kind = (h >> 1) & 3;
+            let size = h >> 3;
+            if kind == 0 {
+                if p + size > e { throw fail("a raw block is cut short"); }
+                for i in p..p + size {
+                    out.push(b[i]);
+                }
+                p += size;
+            } else if kind == 1 {
+                if p >= e { throw fail("an RLE block is cut short"); }
+                for _ in 0..size {
+                    out.push(b[p]);
+                }
+                p += 1;
+            } else if kind == 2 {
+                if p + size > e { throw fail("a compressed block is cut short"); }
+                let (lits, used) = try literals(b, p, p + size, ref st);
+                try sequences(b, p + used, p + size, lits, out, ref st);
+                p += size;
+            } else {
+                throw fail("a reserved block type");
+            }
+            if last { break; }
+        }
+        if checksum { p += 4; }
+    }
+    if p > e { throw fail("the last frame is cut short"); }
+    out
+}

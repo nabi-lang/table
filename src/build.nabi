@@ -1,0 +1,202 @@
+//! Building tables: the `table!` literal, records of a struct
+//! (`#[derive(Record)]`, or `Record` by hand), cells from Nabi values.
+
+use pkg::{Column, Date, DateTime, DType, Table, Value};
+
+/// A Nabi value that is one cell.
+///
+/// ```nabi
+/// use table::ToValue;
+/// assert(3.to_value() == table::Value::Int(3));
+/// let x: f64 | none = none;
+/// assert(x.to_value() == table::Value::Null);
+/// ```
+pub trait ToValue {
+    fn to_value(self) -> Value;
+    /// The column type of this Nabi type.
+    fn dtype() -> DType;
+}
+
+impl ToValue for i64 {
+    fn to_value(self) -> Value { Value::Int(self) }
+    fn dtype() -> DType { DType::I64 }
+}
+
+impl ToValue for i32 {
+    fn to_value(self) -> Value { Value::Int(self as i64) }
+    fn dtype() -> DType { DType::I64 }
+}
+
+impl ToValue for u32 {
+    fn to_value(self) -> Value { Value::Int(self as i64) }
+    fn dtype() -> DType { DType::I64 }
+}
+
+impl ToValue for f64 {
+    fn to_value(self) -> Value { Value::Float(self) }
+    fn dtype() -> DType { DType::F64 }
+}
+
+impl ToValue for f32 {
+    fn to_value(self) -> Value { Value::Float(self as f64) }
+    fn dtype() -> DType { DType::F64 }
+}
+
+impl ToValue for bool {
+    fn to_value(self) -> Value { Value::Bool(self) }
+    fn dtype() -> DType { DType::Bool }
+}
+
+impl ToValue for str {
+    fn to_value(self) -> Value { Value::Str(self) }
+    fn dtype() -> DType { DType::Str }
+}
+
+impl ToValue for Date {
+    fn to_value(self) -> Value { Value::Date(self) }
+    fn dtype() -> DType { DType::Date }
+}
+
+impl ToValue for DateTime {
+    fn to_value(self) -> Value { Value::DateTime(self) }
+    fn dtype() -> DType { DType::DateTime }
+}
+
+impl ToValue for Value {
+    fn to_value(self) -> Value { self }
+    fn dtype() -> DType { DType::Str }
+}
+
+/// `none` is a null cell.
+impl<T: ToValue> ToValue for T | none {
+    fn to_value(self) -> Value {
+        match self {
+            x: T => x.to_value(),
+            none => Value::Null,
+        }
+    }
+    fn dtype() -> DType { T::dtype() }
+}
+
+/// A struct whose values are rows: `#[derive(table::Record)]` writes it
+/// from the fields (each a `ToValue` type), or implement it by hand.
+///
+/// ```nabi
+/// #[derive(table::Record)]
+/// struct Trade { sym: str; qty: i64; px: f64; }
+///
+/// let t = table::record_table([Trade { sym: "A", qty: 10, px: 1.5 }, Trade { sym: "B", qty: 5, px: 2.0 }]);
+/// assert(t.names() == ["sym", "qty", "px"]);
+/// assert(t.row(1).f64("px") == 2.0);
+/// ```
+pub trait Record {
+    /// The column names, in field order.
+    fn names() -> List<str>;
+    /// The column types, in field order.
+    fn dtypes() -> List<DType>;
+    /// This record's cells, in field order.
+    fn cells(self) -> List<Value>;
+}
+
+/// The column type of `T`.
+pub fn dtype_of<T: ToValue>() -> DType { T::dtype() }
+
+/// A table with one row per record; the column types come from the
+/// struct, so an empty list still has the columns.
+pub fn record_table<R: Record>(rs: List<R>) -> Table {
+    let names = R::names();
+    let types = R::dtypes();
+    let bs: List<pkg::column::Builder> = List::from_fn(names.len(), |k| pkg::column::Builder::new(types[k], rs.len()));
+    for r in rs {
+        let cs = r.cells();
+        for k in 0..cs.len() {
+            // The derive's types match the cells; a hand-written impl
+            // that disagrees panics here.
+            try bs[k].push(cs[k]) catch e { panic(f"Record::cells disagrees with Record::dtypes for `{names[k]}`: {e}"); };
+        }
+    }
+    let t = Table::new();
+    for k in 0..names.len() {
+        let c = try bs[k].finish() catch e { panic(f"{e}"); };
+        t = try t.set_column(names[k], c, false) catch e { panic(f"{e}"); };
+    }
+    t
+}
+
+/// `#[derive(Record)]`: `Record` from a named struct's fields.
+#[impl_derive(Record)]
+pub @derive {
+    impl pkg::Record for @Self {
+        fn names() -> List<str> {
+            [@for_fields { @field.name.as_str(), }]
+        }
+        fn dtypes() -> List<pkg::DType> {
+            [@for_fields { pkg::build::dtype_of::<@field.type>(), }]
+        }
+        fn cells(self) -> List<pkg::Value> {
+            [@for_fields { pkg::ToValue::to_value(self.@field), }]
+        }
+    }
+}
+
+/// The `table!` literal's columns as a table; panics on columns of
+/// different lengths or repeated names, which are mistakes in the code.
+pub fn literal(cols: List<(str, Column)>) -> Table {
+    try Table::from_columns(cols) catch e { panic(f"table!: {e}"); }
+}
+
+/// A cell as a list literal of `table!` writes it.
+pub type Cell = i64 | f64 | bool | str | Date | DateTime | none;
+
+/// A literal column from its cells; mixed kinds panic (a mistake in
+/// the code).
+pub fn literal_column(cells: List<Cell>) -> Column {
+    let vs: List<Value> = List::with_capacity(cells.len());
+    for c in cells {
+        vs.push(match c {
+            x: i64 => Value::Int(x),
+            x: f64 => Value::Float(x),
+            x: bool => Value::Bool(x),
+            x: str => Value::Str(x),
+            x: Date => Value::Date(x),
+            x: DateTime => Value::DateTime(x),
+            none => Value::Null,
+        });
+    }
+    try Column::from_values(vs, none) catch e { panic(f"table!: {e}"); }
+}
+
+/// `table!{ "name": [cells], .. }`: a table literal, one column per
+/// entry in order. Each column is a list literal of cells: numbers,
+/// strings, bools, dates, `none` for a null. (Build from existing
+/// columns with `Table::from_columns`.)
+///
+/// ```nabi
+/// let t = table::table!{
+///     "id": [1, 2, 3],
+///     "score": [0.5, none, 2.0],
+///     "tag": ["a", "b", "a"],
+/// };
+/// assert(t.shape() == (3, 3));
+/// assert(t.column_at(1).null_count() == 1);
+/// ```
+#[impl_macro(table)]
+pub @macro {
+    (@rep[sep = ",", trailing] { @k: expr : [ @rep[sep = ",", trailing] { @x: expr } ] }) => {
+        pkg::build::literal([@for @k { (@k, pkg::build::literal_column([@for @x { @x, }])), }])
+    }
+}
+
+/// `column![cells]`: one column from literal cells, as an entry of
+/// `table!` reads them.
+///
+/// ```nabi
+/// let c = table::column![1, none, 3];
+/// assert(c.null_count() == 1 && c.dtype() == table::DType::I64);
+/// ```
+#[impl_macro(column)]
+pub @macro {
+    (@rep[sep = ",", trailing] { @x: expr }) => {
+        pkg::build::literal_column([@for @x { @x, }])
+    }
+}

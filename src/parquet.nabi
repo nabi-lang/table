@@ -1,0 +1,196 @@
+//! Parquet files, read and written without a Parquet library. Writing:
+//! flat optional columns (`i64` INT64, `f64` DOUBLE, `bool` BOOLEAN,
+//! `str` and `cat` BYTE_ARRAY strings, dictionary-encoded for `cat` and
+//! for `str` with few distinct values, `date` DATE, `datetime`
+//! TIMESTAMP(NANOS)), data pages v1, min / max statistics, Snappy or no
+//! compression, and the Arrow schema in the metadata. Reading: data
+//! pages v1 and v2; PLAIN, dictionary, RLE, DELTA_BINARY_PACKED,
+//! DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT
+//! encodings; Snappy, Zstandard or no compression; INT32 / INT64 of any
+//! integer logical type, INT96 and every timestamp unit, FLOAT, DOUBLE,
+//! FLOAT16, strings. Nested, decimal, time and fixed-length binary
+//! columns are an error naming the column, unless `columns` leaves them
+//! out; gzip, Brotli and LZ4 pages are an error.
+
+pub(pkg) mod read;
+pub(pkg) mod rle;
+pub(pkg) mod thrift;
+
+mod write;
+
+use pkg::{Schema, Table, TableError, Value};
+use std::fs;
+
+/// The page compression a written file uses.
+///
+/// ```nabi
+/// use table::{Compression, Parquet};
+/// let t = table::table!{ "x": [1, 2, 3] };
+/// let b = Parquet::new().compression(Compression::None).write_bytes(t);
+/// assert(try Parquet::new().read_bytes(b) == t);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Compression {
+    None,
+    /// Snappy: fast, about 2x on typical tables; the default, as in
+    /// pyarrow and Polars.
+    Snappy,
+}
+
+/// A predicate a scan can test against row-group statistics: `col op v`
+/// with `op` one of `== != < <= > >=`.
+#[derive(Clone)]
+pub(pkg) struct Bound {
+    pub(pkg) col: str;
+    pub(pkg) op: str;
+    pub(pkg) v: Value;
+}
+
+fn numeric(x: Value) -> bool {
+    match x {
+        Value::Int(_) | Value::Float(_) => true,
+        _ => false,
+    }
+}
+
+fn comparable(a: Value, b: Value) -> bool { (numeric(a) && numeric(b)) || a.dtype() == b.dtype() }
+
+impl Bound {
+    /// Whether some value in `lo..=hi` meets the bound.
+    pub(pkg) fn may(self, lo: Value, hi: Value) -> bool {
+        if !comparable(lo, self.v) || !comparable(hi, self.v) { return true; }
+        if let x: f64 = self.v.as_f64() {
+            if x != x { return true; }
+        }
+        let c = |a: Value| -> i64 {
+            match a.total_cmp(self.v) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            }
+        };
+        match self.op {
+            ">" => c(hi) > 0,
+            ">=" => c(hi) >= 0,
+            "<" => c(lo) < 0,
+            "<=" => c(lo) <= 0,
+            "==" => c(lo) <= 0 && c(hi) >= 0,
+            "!=" => !(c(lo) == 0 && c(hi) == 0),
+            _ => true,
+        }
+    }
+}
+
+/// How to read or write Parquet. Start from `Parquet::new()`.
+///
+/// ```nabi
+/// use table::Parquet;
+/// let t = table::table!{ "city": ["Seoul", "Busan", none], "temp": [21.5, 24.0, 19.0] };
+/// let b = Parquet::new().write_bytes(t);
+/// assert(try Parquet::new().read_bytes(b) == t);
+/// let temps = try Parquet::new().columns(["temp"]).read_bytes(b);
+/// assert(temps.names() == ["temp"]);
+/// ```
+#[derive(Clone)]
+pub struct Parquet {
+    cols: List<str> | none;
+    group_rows: usize;
+    page_rows: usize;
+    how: Compression;
+    dict: bool;
+    pub(pkg) bounds: List<Bound>;
+    pub(pkg) limit: usize;
+}
+
+impl Parquet {
+    /// Every column; row groups of 1048576 rows, pages of 65536 rows,
+    /// Snappy, dictionaries where they pay.
+    pub fn new() -> Parquet {
+        Parquet { cols: none, group_rows: 1048576, page_rows: 65536, how: Compression::Snappy, dict: true, bounds: List::new(), limit: usize::MAX }
+    }
+
+    /// Read only these columns, in this order; the other column chunks
+    /// are not read at all.
+    pub fn columns(self, names: List<str>) -> Parquet {
+        let p = self.clone();
+        p.cols = names;
+        p
+    }
+
+    /// Write row groups of at most `n` rows: smaller groups let a
+    /// filtered scan skip more by their statistics.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1, 2, 3, 4, 5] };
+    /// let b = table::Parquet::new().row_group_rows(2).write_bytes(t);
+    /// assert(try table::Parquet::new().read_bytes(b) == t);
+    /// ```
+    pub fn row_group_rows(self, n: usize) -> Parquet {
+        let p = self.clone();
+        p.group_rows = n.max(1);
+        p
+    }
+
+    /// Write data pages of at most `n` rows.
+    pub fn page_rows(self, n: usize) -> Parquet {
+        let p = self.clone();
+        p.page_rows = n.max(1);
+        p
+    }
+
+    /// The page compression to write (reading takes any it supports).
+    pub fn compression(self, c: Compression) -> Parquet {
+        let p = self.clone();
+        p.how = c;
+        p
+    }
+
+    /// Whether to write dictionary pages (`cat` columns, and `str`
+    /// columns with few distinct values); `false` writes every value
+    /// PLAIN (a `cat` column still reads back as `cat`, through the Arrow
+    /// schema the file carries).
+    pub fn dictionary(self, yes: bool) -> Parquet {
+        let p = self.clone();
+        p.dict = yes;
+        p
+    }
+
+    /// The table in `b`.
+    pub fn read_bytes(self, b: List<u8>) throws (TableError) -> Table { try read::read(b, self.cols, self.bounds, self.limit) }
+
+    /// The table in the file at `path`.
+    pub fn read_file(self, path: str) throws (TableError) -> Table { try self.read_bytes(try pkg::arrow::load(path)) }
+
+    /// `t` as Parquet bytes.
+    pub fn write_bytes(self, t: Table) -> List<u8> { write::write(t, self.group_rows, self.page_rows, self.how, self.dict) }
+
+    /// Write `t` to `path`, replacing it.
+    pub fn write_file(self, t: Table, path: str) throws (TableError) {
+        try fs::write(path, self.write_bytes(t)) catch e { throw TableError::Io { msg: f"cannot write `{path}`: {e}" }; };
+    }
+}
+
+/// The Parquet file at `path`: `Parquet::new().read_file(path)`.
+///
+/// ```nabi norun
+/// let t = try "trips.parquet" |> table::read_parquet;
+/// ```
+pub fn read_parquet(path: str) throws (TableError) -> Table { try Parquet::new().read_file(path) }
+
+/// Write `t` to `path` as Parquet with the defaults of `Parquet::new()`.
+///
+/// ```nabi norun
+/// # let t = table::table!{ "x": [1, 2, 3] };
+/// try t |> table::write_parquet("trips.parquet");
+/// ```
+pub fn write_parquet(t: Table, path: str) throws (TableError) { try Parquet::new().write_file(t, path) }
+
+/// The schema of the Parquet data in `b` (its readable columns), from
+/// the footer alone.
+///
+/// ```nabi
+/// let t = table::table!{ "n": [1, 2], "s": ["a", "b"] };
+/// let s = try table::parquet_schema(table::Parquet::new().write_bytes(t));
+/// assert(s.dtype("s") == table::DType::Str);
+/// ```
+pub fn parquet_schema(b: List<u8>) throws (TableError) -> Schema { try read::schema(b) }

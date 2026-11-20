@@ -1,0 +1,45 @@
+// Read and write a 1e6-row CSV (an id, a float, a short string, a
+// date per row; about 34 MB).
+
+use core::bench::Bench;
+use core::hint::black_box;
+
+fn text(n: usize) -> str {
+    let b = StrBuf::new();
+    b.push_str("id,price,tag,day\n");
+    for i in 0..n {
+        b.push_str(f"{i},{(i % 1000) as f64 * 0.25 + 0.125},tag{i % 37},2024-0{i % 9 + 1}-1{i % 10}\n");
+    }
+    b.to_str()
+}
+
+#[bench]
+fn read_1e6(b: Bench) {
+    let s = text(1000000);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| try pkg::read_csv_str(black_box(s)) catch e { panic(f"{e}"); });
+}
+
+#[bench]
+fn stream_1e6(b: Bench) {
+    let s = text(1000000);
+    b.set_bytes(s.len() as i64);
+    b.iter(|| {
+        let r = pkg::Csv::new().reader(core::io::Cursor::new(black_box(s).as_bytes().to_list()));
+        let n = 0;
+        loop {
+            let t = try r.next() catch e { panic(f"{e}"); };
+            match t {
+                x: pkg::Table => { n += x.nrows(); },
+                none => break,
+            }
+        }
+        n
+    });
+}
+
+#[bench]
+fn write_1e6(b: Bench) {
+    let t = try pkg::read_csv_str(text(1000000)) catch e { panic(f"{e}"); };
+    b.iter(|| pkg::Csv::new().write_str(black_box(t)));
+}

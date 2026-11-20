@@ -1,0 +1,109 @@
+//! Column types and the schema of a table.
+
+/// The type of a column.
+///
+/// ```nabi
+/// assert(f"{table::DType::F64}" == "f64");
+/// assert(table::DType::I64.is_numeric());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DType {
+    I64,
+    F64,
+    Bool,
+    Str,
+    /// Dictionary-encoded strings: a code per row into a list of
+    /// distinct values. Reads and compares as `Str`.
+    Cat,
+    Date,
+    DateTime,
+}
+
+impl DType {
+    /// `I64` or `F64`.
+    pub fn is_numeric(self) -> bool { self == DType::I64 || self == DType::F64 }
+
+    /// `Str` or `Cat`.
+    pub fn is_text(self) -> bool { self == DType::Str || self == DType::Cat }
+
+    /// The name `Display` writes, also accepted by `parse`.
+    pub fn name(self) -> str {
+        match self {
+            DType::I64 => "i64",
+            DType::F64 => "f64",
+            DType::Bool => "bool",
+            DType::Str => "str",
+            DType::Cat => "cat",
+            DType::Date => "date",
+            DType::DateTime => "datetime",
+        }
+    }
+
+    /// The type named `s` (`"i64"`, `"f64"`, `"bool"`, `"str"`, `"cat"`,
+    /// `"date"`, `"datetime"`).
+    pub fn parse(s: str) -> DType | none {
+        match s {
+            "i64" => DType::I64,
+            "f64" => DType::F64,
+            "bool" => DType::Bool,
+            "str" => DType::Str,
+            "cat" => DType::Cat,
+            "date" => DType::Date,
+            "datetime" => DType::DateTime,
+            _ => none,
+        }
+    }
+}
+
+impl Display for DType {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.name()) }
+}
+
+/// A column's name and type.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Field {
+    pub name: str;
+    pub dtype: DType;
+}
+
+/// The names and types of a table's columns, in order.
+///
+/// ```nabi
+/// let t = table::table!{ "id": [1, 2], "score": [0.5, 1.5] };
+/// let s = t.schema();
+/// assert(s.len() == 2);
+/// assert(s.dtype("score") == table::DType::F64);
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct Schema {
+    pub fields: List<Field>;
+}
+
+impl Schema {
+    /// From `(name, type)` pairs.
+    pub fn new(fields: List<(str, DType)>) -> Schema {
+        Schema { fields: fields.iter().map(|p| Field { name: p.0, dtype: p.1 }).collect() }
+    }
+
+    /// The number of columns.
+    pub fn len(self) -> usize { self.fields.len() }
+
+    /// The column names, in order.
+    pub fn names(self) -> List<str> { self.fields.iter().map(|f| f.name).collect() }
+
+    /// The type of column `name`, `none` when there is no such column.
+    pub fn dtype(self, name: str) -> DType | none {
+        for f in self.fields {
+            if f.name == name { return f.dtype; }
+        }
+        none
+    }
+}
+
+/// `name: type` per line.
+impl Display for Schema {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let lines: List<str> = self.fields.iter().map(|x| f"{x.name}: {x.dtype}").collect();
+        try f.write_str(lines.join("\n"))
+    }
+}

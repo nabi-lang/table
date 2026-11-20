@@ -1,0 +1,30 @@
+// Display: the text preview and Markdown.
+
+use pkg::{Column, Table};
+
+#[test]
+fn preview_text() {
+    let t = pkg::table!{ "name": ["ann", "bob"], "score": [1.5, none], "n": [10, 200] };
+    let s = f"{t}";
+    let want = "shape: (2, 3)\nname | score | n\nstr  | f64   | i64\n-----+-------+----\nann  |   1.5 |  10\nbob  |  null | 200";
+    assert(s == want, s);
+    let wide = Table::new();
+    for k in 0..12 { wide = try wide.with(f"c{k}", Column::from([k as i64])) catch e { panic(f"{e}"); }; }
+    let w = wide.preview(10, 4);
+    assert(w.contains("c0") && w.contains("c1") && w.contains("...") && w.contains("c11") && !w.contains("c5"), w);
+    let long = try Table::from_columns([("x", Column::from(List::from_fn(100, |i| i as i64)))]) catch e { panic(f"{e}"); };
+    let l = long.preview(4, 8);
+    assert(l.contains("\n 0\n") || l.contains(" 0\n"), l);
+    assert(l.contains("...") && l.contains("99") && !l.contains("50"), l);
+    let clip = pkg::table!{ "t": ["abcdefghijklmnopqrstuvwxyz0123456789"] };
+    assert(f"{clip}".contains("abcdefghijklmnopqrstu..."), f"{clip}");
+    assert(f"{Table::new()}".starts_with("shape: (0, 0)"));
+    assert(f"{Column::from([1, 2])}" == "[1, 2] (2 x i64)");
+}
+
+#[test]
+fn markdown() {
+    let t = pkg::table!{ "a": [1, none], "b": ["x|y", "z"] };
+    assert(t.to_markdown() == "| a | b |\n| ---: | :--- |\n| 1 | x\\|y |\n|  | z |\n");
+    assert(Table::new().to_markdown() == "|  |\n|  |\n");
+}

@@ -1,0 +1,106 @@
+//! Arrow IPC: the file format (`.arrow`, Feather v2) and the streaming
+//! format, read and written without an Arrow library. Columns map to
+//! Arrow types one to one (`i64` int64, `f64` float64, `bool`, `str`
+//! utf8, `cat` a utf8 dictionary with int32 indices, `date` date32,
+//! `datetime` timestamp[ns]); reading also widens the narrower integer
+//! and float types, date64, any timestamp unit and large_utf8, and
+//! decompresses ZSTD and LZ4 frame bodies. Nested, decimal, binary,
+//! time, duration and view types are an error naming the column, unless
+//! `columns` leaves them out.
+
+pub(pkg) mod read;
+pub(pkg) mod write;
+
+mod flat;
+
+use pkg::{Schema, Table, TableError};
+use std::fs;
+
+/// How to read or write Arrow IPC data. Start from `Arrow::new()`.
+///
+/// ```nabi
+/// use table::Arrow;
+/// let t = table::table!{ "id": [1, 2, 3], "name": ["a", none, "c"] };
+/// let bytes = Arrow::new().write_bytes(t);
+/// let back = try Arrow::new().read_bytes(bytes);
+/// assert(back == t);
+/// let ids = try Arrow::new().columns(["id"]).read_bytes(bytes);
+/// assert(ids.names() == ["id"]);
+/// ```
+#[derive(Clone)]
+pub struct Arrow {
+    cols: List<str> | none;
+    rows: usize;
+    stream: bool;
+}
+
+impl Arrow {
+    /// Read every column; write the file format in one record batch.
+    pub fn new() -> Arrow { Arrow { cols: none, rows: usize::MAX, stream: false } }
+
+    /// Read only these columns, in this order; the others are skipped
+    /// without decoding.
+    pub fn columns(self, names: List<str>) -> Arrow { Arrow { cols: names, rows: self.rows, stream: self.stream } }
+
+    /// Write record batches of at most `n` rows.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1, 2, 3, 4, 5] };
+    /// let b = table::Arrow::new().batch_rows(2).write_bytes(t);
+    /// assert(try table::Arrow::new().read_bytes(b) == t);
+    /// ```
+    pub fn batch_rows(self, n: usize) -> Arrow { Arrow { cols: self.cols, rows: n.max(1), stream: self.stream } }
+
+    /// Write the streaming format (no footer; what a socket or pipe
+    /// carries) instead of the file format. Reading tells them apart by
+    /// themselves.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1.5, 2.5] };
+    /// let b = table::Arrow::new().stream(true).write_bytes(t);
+    /// assert(try table::Arrow::new().read_bytes(b) == t);
+    /// ```
+    pub fn stream(self, yes: bool) -> Arrow { Arrow { cols: self.cols, rows: self.rows, stream: yes } }
+
+    /// The table in `b`, file or stream format.
+    pub fn read_bytes(self, b: List<u8>) throws (TableError) -> Table { try read::read(b, self.cols) }
+
+    /// The table in the file at `path`.
+    pub fn read_file(self, path: str) throws (TableError) -> Table { try self.read_bytes(try load(path)) }
+
+    /// `t` as Arrow IPC bytes.
+    pub fn write_bytes(self, t: Table) -> List<u8> { write::write(t, self.rows, self.stream) }
+
+    /// Write `t` to `path`, replacing it.
+    pub fn write_file(self, t: Table, path: str) throws (TableError) {
+        try fs::write(path, self.write_bytes(t)) catch e { throw TableError::Io { msg: f"cannot write `{path}`: {e}" }; };
+    }
+}
+
+pub(pkg) fn load(path: str) throws (TableError) -> List<u8> {
+    try fs::read(path) catch e { throw TableError::Io { msg: f"cannot read `{path}`: {e}" }; }
+}
+
+/// The Arrow file (or stream) at `path`: `Arrow::new().read_file(path)`.
+///
+/// ```nabi norun
+/// let t = try "trips.arrow" |> table::read_arrow;
+/// ```
+pub fn read_arrow(path: str) throws (TableError) -> Table { try Arrow::new().read_file(path) }
+
+/// Write `t` to `path` in the Arrow file format.
+///
+/// ```nabi norun
+/// # let t = table::table!{ "x": [1, 2, 3] };
+/// try t |> table::write_arrow("trips.arrow");
+/// ```
+pub fn write_arrow(t: Table, path: str) throws (TableError) { try Arrow::new().write_file(t, path) }
+
+/// The schema of the Arrow data in `b`, without reading its rows.
+///
+/// ```nabi
+/// let t = table::table!{ "d": [date"2024-01-02"] };
+/// let s = try table::arrow_schema(table::Arrow::new().write_bytes(t));
+/// assert(s.dtype("d") == table::DType::Date);
+/// ```
+pub fn arrow_schema(b: List<u8>) throws (TableError) -> Schema { try read::schema(b) }

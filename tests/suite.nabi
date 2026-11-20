@@ -1,0 +1,15 @@
+// Tests for every operation, nulls and empty tables included.
+
+mod arrow;
+mod basics;
+mod codec;
+mod dates;
+mod display;
+mod exprs;
+mod grouping;
+mod io;
+mod joins;
+mod lazy;
+mod parquet;
+mod reshape;
+mod sorting;

@@ -1,0 +1,184 @@
+// Parquet's integer encodings: the RLE / bit-packed hybrid (levels and
+// dictionary indices), bit packing, and the DELTA_BINARY_PACKED family
+// for reading.
+
+use pkg::TableError;
+use pkg::bytes::{bad, u64_at};
+
+const FMT: str = "parquet";
+
+fn fail(msg: str) -> TableError { bad(FMT, msg) }
+
+/// `n` bits at bit `q` of `b[s..e]`, LSB first; zeros past the end.
+fn bits(b: List<u8>, s: usize, e: usize, q: usize, n: usize) -> u64 {
+    if n == 0 { return 0u64; }
+    let p = s + (q >> 3);
+    let v = 0u64;
+    if p + 8 <= e {
+        v = u64_at(b, p);
+    } else {
+        for i in 0..8 {
+            if p + i < e { v = v | ((b[p + i] as u64) << (8 * i) as u64); }
+        }
+    }
+    let sh = (q & 7) as u64;
+    let x = v >> sh;
+    // A width over 56 can straddle nine bytes.
+    if n as u64 + sh > 64u64 && p + 8 < e { x = x | ((b[p + 8] as u64) << (64u64 - sh)); }
+    if n == 64 { x } else { x & ((1u64 << n as u64) - 1u64) }
+}
+
+fn uvarint(b: List<u8>, p: usize, e: usize) throws (TableError) -> (u64, usize) {
+    let v = 0u64;
+    let s = 0u64;
+    let q = p;
+    loop {
+        if q >= e || s > 63u64 { throw fail("a varint is cut short"); }
+        let x = b[q] as u64;
+        q += 1;
+        v = v | ((x & 127u64) << s);
+        if x < 128u64 { return (v, q); }
+        s += 7u64;
+    }
+}
+
+/// `n` values of width `w` from the hybrid encoding in `b[s..e]` (no
+/// length prefix); a run cut short is an error.
+pub(pkg) fn hybrid(b: List<u8>, s: usize, e: usize, w: usize, n: usize) throws (TableError) -> List<u32> {
+    if w > 32 { throw fail(f"a bit width of {w}"); }
+    let out: List<u32> = List::with_capacity(n);
+    let p = s;
+    let vb = (w + 7) / 8;
+    while out.len() < n {
+        let (h, q) = try uvarint(b, p, e);
+        p = q;
+        if h & 1u64 == 0u64 {
+            let run = (h >> 1u64) as usize;
+            if p + vb > e { throw fail("an RLE run is cut short"); }
+            let v = 0u64;
+            for i in 0..vb {
+                v = v | ((b[p + i] as u64) << (8 * i) as u64);
+            }
+            p += vb;
+            let k = run.min(n - out.len());
+            for _ in 0..k {
+                out.push(v as u32);
+            }
+        } else {
+            let groups = (h >> 1u64) as usize;
+            let nbytes = groups * w;
+            if p + nbytes > e && out.len() + groups * 8 <= n { throw fail("a bit-packed run is cut short"); }
+            let k = (groups * 8).min(n - out.len());
+            let end = (p + nbytes).min(e);
+            for i in 0..k {
+                out.push(bits(b, p, end, i * w, w) as u32);
+            }
+            p += nbytes;
+        }
+    }
+    out
+}
+
+fn put_varint(b: List<u8>, v: u64) {
+    let x = v;
+    while x >= 128u64 {
+        b.push((x & 127u64 | 128u64) as u8);
+        x = x >> 7u64;
+    }
+    b.push(x as u8);
+}
+
+/// The length of the run of equal values at `i`, at most `cap`.
+fn run(xs: List<u32>, i: usize, cap: usize) -> usize {
+    let r = 1usize;
+    while i + r < xs.len() && r < cap && xs[i + r] == xs[i] {
+        r += 1;
+    }
+    r
+}
+
+/// Append `xs` in the hybrid encoding with width `w`: runs of eight or
+/// more equal values as RLE, the rest bit-packed in groups of eight.
+pub(pkg) fn put_hybrid(b: List<u8>, xs: List<u32>, w: usize) {
+    let n = xs.len();
+    let vb = (w + 7) / 8;
+    let i = 0usize;
+    while i < n {
+        let r = run(xs, i, usize::MAX);
+        if r >= 8 {
+            put_varint(b, (r as u64) << 1u64);
+            let v = xs[i] as u64;
+            for k in 0..vb {
+                b.push((v >> (8 * k) as u64) as u8);
+            }
+            i += r;
+            continue;
+        }
+        let j = i;
+        while j < n && j - i < 504 {
+            if (j - i) % 8 == 0 && j > i && run(xs, j, 8) >= 8 { break; }
+            j += 1;
+        }
+        let groups = (j - i + 7) / 8;
+        put_varint(b, ((groups as u64) << 1u64) | 1u64);
+        let acc = 0u64;
+        let have = 0usize;
+        for k in 0..groups * 8 {
+            let v = if i + k < j { xs[i + k] as u64 } else { 0u64 };
+            acc = acc | (v << have as u64);
+            have += w;
+            while have >= 8 {
+                b.push(acc as u8);
+                acc = acc >> 8u64;
+                have -= 8;
+            }
+        }
+        i = j;
+    }
+}
+
+/// The bit width a value up to `max` needs.
+pub(pkg) fn width(max: u64) -> usize {
+    if max == 0u64 { 0 } else { 64 - max.leading_zeros() as usize }
+}
+
+/// DELTA_BINARY_PACKED: the values and the position after them.
+pub(pkg) fn delta(b: List<u8>, s: usize, e: usize) throws (TableError) -> (List<i64>, usize) {
+    let (block, p) = try uvarint(b, s, e);
+    let (minis, p) = try uvarint(b, p, e);
+    let (total, p) = try uvarint(b, p, e);
+    let (first, p) = try uvarint(b, p, e);
+    if minis == 0u64 || block == 0u64 || block % minis != 0u64 || (block / minis) % 8u64 != 0u64 { throw fail("a delta block header is malformed"); }
+    let per = (block / minis) as usize;
+    let n = total as usize;
+    let out: List<i64> = List::with_capacity(n);
+    let cur = zz(first);
+    if n > 0 { out.push(cur); }
+    let q = p;
+    while out.len() < n {
+        let (md, q2) = try uvarint(b, q, e);
+        q = q2;
+        let min_delta = zz(md);
+        let m = minis as usize;
+        if q + m > e { throw fail("delta bit widths are cut short"); }
+        let ws: List<usize> = List::from_fn(m, |k| b[q + k] as usize);
+        q += m;
+        for k in 0..m {
+            if out.len() >= n { break; }
+            let w = ws[k];
+            if w > 64 { throw fail("a delta bit width above 64"); }
+            let nbytes = per * w / 8;
+            if q + nbytes > e { throw fail("a delta miniblock is cut short"); }
+            for i in 0..per {
+                if out.len() >= n { break; }
+                let d = bits(b, q, q + nbytes, i * w, w) as i64;
+                cur = cur.wrapping_add(min_delta).wrapping_add(d);
+                out.push(cur);
+            }
+            q += nbytes;
+        }
+    }
+    (out, q)
+}
+
+fn zz(v: u64) -> i64 { ((v >> 1u64) as i64) ^ -((v & 1u64) as i64) }

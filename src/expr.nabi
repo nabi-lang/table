@@ -1,0 +1,443 @@
+//! Column expressions: a small tree built with the dot operators
+//! (`col("x") .* 2 .+ col("y")`, `col("a") .> 3 .&& col("b") .== "k"`)
+//! and evaluated column at a time against a table.
+
+pub(pkg) mod eval;
+pub(pkg) mod window;
+
+use pkg::{Date, DateTime, DType, Value};
+
+/// A computed column: names columns with `col`, scalars with `lit` (or
+/// a plain number, string, bool or date on either side of an
+/// operator), and combines them with the dot operators. Nulls
+/// propagate; `.&&` / `.||` use three-valued logic (`false .&& null`
+/// is `false`).
+///
+/// | Operators                          | Result                          |
+/// |------------------------------------|---------------------------------|
+/// | `.+ .- .* .%`                      | `i64` for two `i64`, else `f64` |
+/// | `./ .**`                           | `f64`                           |
+/// | `.== .!= .< .<= .> .>=`            | `bool`                          |
+/// | `.&& .||`, prefix `!`              | `bool`                          |
+/// | prefix `-`                         | the operand's type              |
+///
+/// ```nabi
+/// use table::{col, lit};
+/// let t = table::table!{ "x": [1.0, 2.0, 3.0], "y": [4.0, 5.0, 6.0] };
+/// let e = (col("x") .+ col("y")) ./ 2 .- lit(1.0);
+/// let u = try t.with_column("m", e) catch _ { t };
+/// assert(u.row(0).f64("m") == 1.5);
+/// ```
+pub struct Expr {
+    pub(pkg) node: Node;
+    pub(pkg) kids: List<Expr>;
+}
+
+// Expressions are immutable, so a copy shares its subtrees.
+impl Clone for Expr {
+    fn clone(self) -> Expr { Expr { node: self.node, kids: self.kids } }
+}
+
+pub(pkg) enum Node {
+    Col(str),
+    Lit(Value),
+    Bin(Op),
+    Neg,
+    Not,
+    IsNull,
+    NotNull,
+    FillNull,
+    Cast(DType),
+    IsIn(List<Value>),
+    Func(Fun),
+    Text(TextOp, str),
+    When,
+    Cum(Cum),
+    Roll(Roll, usize, usize),
+    Shift(i64),
+    Map(fn(Value) -> Value),
+    MapF64(fn(f64) -> f64),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(pkg) enum Op { Add, Sub, Mul, Div, Rem, Pow, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
+
+#[derive(Clone, Copy, PartialEq)]
+pub(pkg) enum Fun { Abs, Sqrt, Exp, Ln, Log10, Round, Floor, Ceil, Year, Month, Day, Weekday, Len, Upper, Lower }
+
+#[derive(Clone, Copy, PartialEq)]
+pub(pkg) enum TextOp { Contains, StartsWith, EndsWith }
+
+/// Running totals down a column.
+#[derive(Clone, Copy, PartialEq)]
+pub(pkg) enum Cum { Sum, Prod, Min, Max, Count }
+
+/// Statistics over a sliding window of rows.
+#[derive(Clone, Copy, PartialEq)]
+pub(pkg) enum Roll { Sum, Mean, Min, Max, Std }
+
+impl Op {
+    pub(pkg) fn token(self) -> str {
+        match self {
+            Op::Add => ".+",
+            Op::Sub => ".-",
+            Op::Mul => ".*",
+            Op::Div => "./",
+            Op::Rem => ".%",
+            Op::Pow => ".**",
+            Op::Eq => ".==",
+            Op::Ne => ".!=",
+            Op::Lt => ".<",
+            Op::Le => ".<=",
+            Op::Gt => ".>",
+            Op::Ge => ".>=",
+            Op::And => ".&&",
+            Op::Or => ".||",
+        }
+    }
+
+    pub(pkg) fn is_cmp(self) -> bool {
+        self == Op::Eq || self == Op::Ne || self == Op::Lt || self == Op::Le || self == Op::Gt || self == Op::Ge
+    }
+}
+
+/// Column `name` of the table the expression runs against.
+///
+/// ```nabi
+/// let e = table::col("price") .* 1.1;
+/// assert(f"{e}" == "(col(\"price\") .* 1.1)");
+/// ```
+pub fn col(name: str) -> Expr { Expr { node: Node::Col(name), kids: List::new() } }
+
+/// A scalar, the same in every row.
+///
+/// ```nabi
+/// let e = table::lit(2.5);
+/// assert(f"{e}" == "2.5");
+/// ```
+pub fn lit<T: IntoExpr>(v: T) -> Expr { v.into_expr() }
+
+/// `then` where `cond` is `true`, else `otherwise`; start with `when`.
+///
+/// ```nabi
+/// use table::{col, when};
+/// let t = table::table!{ "x": [-1.0, 2.0] };
+/// let u = try t.with_column("pos", when(col("x") .> 0).then(col("x")).otherwise(0.0)) catch _ { t };
+/// assert(u.row(0).f64("pos") == 0.0);
+/// ```
+pub fn when<C: IntoExpr>(cond: C) -> When { When { cond: cond.into_expr() } }
+
+/// A `when(..)` waiting for its `then`.
+pub struct When {
+    cond: Expr;
+}
+
+/// A `when(..).then(..)` waiting for its `otherwise`.
+pub struct Then {
+    cond: Expr;
+    then: Expr;
+}
+
+impl When {
+    /// The value where the condition holds.
+    pub fn then<T: IntoExpr>(self, v: T) -> Then { Then { cond: self.cond, then: v.into_expr() } }
+}
+
+impl Then {
+    /// The value elsewhere (null condition included); the finished expression.
+    pub fn otherwise<T: IntoExpr>(self, v: T) -> Expr {
+        Expr { node: Node::When, kids: [self.cond, self.then, v.into_expr()] }
+    }
+}
+
+/// What can stand on either side of an expression operator: an `Expr`,
+/// a number, string, bool, date or `Value`.
+pub trait IntoExpr {
+    fn into_expr(self) -> Expr;
+}
+
+impl IntoExpr for Expr {
+    fn into_expr(self) -> Expr { self }
+}
+
+impl IntoExpr for Value {
+    fn into_expr(self) -> Expr { Expr { node: Node::Lit(self), kids: List::new() } }
+}
+
+impl IntoExpr for i64 {
+    fn into_expr(self) -> Expr { Value::Int(self).into_expr() }
+}
+
+impl IntoExpr for i32 {
+    fn into_expr(self) -> Expr { Value::Int(self as i64).into_expr() }
+}
+
+impl IntoExpr for f64 {
+    fn into_expr(self) -> Expr { Value::Float(self).into_expr() }
+}
+
+impl IntoExpr for bool {
+    fn into_expr(self) -> Expr { Value::Bool(self).into_expr() }
+}
+
+impl IntoExpr for str {
+    fn into_expr(self) -> Expr { Value::Str(self).into_expr() }
+}
+
+impl IntoExpr for Date {
+    fn into_expr(self) -> Expr { Value::Date(self).into_expr() }
+}
+
+impl IntoExpr for DateTime {
+    fn into_expr(self) -> Expr { Value::DateTime(self).into_expr() }
+}
+
+pub(pkg) fn bin(op: Op, a: Expr, b: Expr) -> Expr { Expr { node: Node::Bin(op), kids: [a, b] } }
+
+impl Expr {
+    fn unary(self, node: Node) -> Expr { Expr { node, kids: [self] } }
+
+    fn fun(self, f: Fun) -> Expr { self.unary(Node::Func(f)) }
+
+    /// `true` where the value is null.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1, none] };
+    /// assert((try t.filter(table::col("x").is_null()) catch _ { t }).nrows() == 1);
+    /// ```
+    pub fn is_null(self) -> Expr { self.unary(Node::IsNull) }
+
+    /// `true` where there is a value.
+    pub fn is_not_null(self) -> Expr { self.unary(Node::NotNull) }
+
+    /// Nulls replaced by `v`.
+    pub fn fill_null<T: IntoExpr>(self, v: T) -> Expr { Expr { node: Node::FillNull, kids: [self, v.into_expr()] } }
+
+    /// The values as type `t` (`Column::cast`).
+    pub fn cast(self, t: DType) -> Expr { self.unary(Node::Cast(t)) }
+
+    /// `true` where the value is one of `vs`.
+    ///
+    /// ```nabi
+    /// use table::Value;
+    /// let t = table::table!{ "c": ["a", "b", "c"] };
+    /// let u = try t.filter(table::col("c").is_in([Value::Str("a"), Value::Str("c")])) catch _ { t };
+    /// assert(u.nrows() == 2);
+    /// ```
+    pub fn is_in(self, vs: List<Value>) -> Expr { self.unary(Node::IsIn(vs)) }
+
+    /// `|x|`, keeping the type.
+    pub fn abs(self) -> Expr { self.fun(Fun::Abs) }
+    /// Square root, as `f64`.
+    pub fn sqrt(self) -> Expr { self.fun(Fun::Sqrt) }
+    /// `e` to the value, as `f64`.
+    pub fn exp(self) -> Expr { self.fun(Fun::Exp) }
+    /// Natural logarithm.
+    pub fn ln(self) -> Expr { self.fun(Fun::Ln) }
+    /// Base-10 logarithm, as `f64`.
+    pub fn log10(self) -> Expr { self.fun(Fun::Log10) }
+    /// Half away from zero, as `f64::round`.
+    pub fn round(self) -> Expr { self.fun(Fun::Round) }
+    /// Round down (an `i64` column stays as it is).
+    pub fn floor(self) -> Expr { self.fun(Fun::Floor) }
+    /// Round up (an `i64` column stays as it is).
+    pub fn ceil(self) -> Expr { self.fun(Fun::Ceil) }
+
+    /// The year of a date or timestamp, as `i64`.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "d": [date"2024-03-01", date"1999-12-31"] };
+    /// let u = try t.with_column("y", table::col("d").year()) catch _ { t };
+    /// assert(u.row(1).i64("y") == 1999);
+    /// ```
+    pub fn year(self) -> Expr { self.fun(Fun::Year) }
+    /// The month of a date or timestamp, 1 to 12.
+    pub fn month(self) -> Expr { self.fun(Fun::Month) }
+    /// The day of the month, 1 to 31.
+    pub fn day(self) -> Expr { self.fun(Fun::Day) }
+    /// Monday 0 to Sunday 6.
+    pub fn weekday(self) -> Expr { self.fun(Fun::Weekday) }
+
+    /// The length of a string in code points.
+    pub fn len(self) -> Expr { self.fun(Fun::Len) }
+    /// The text in upper case.
+    pub fn upper(self) -> Expr { self.fun(Fun::Upper) }
+    /// The text in lower case.
+    pub fn lower(self) -> Expr { self.fun(Fun::Lower) }
+    /// `true` where the text contains `s`.
+    pub fn contains(self, s: str) -> Expr { self.unary(Node::Text(TextOp::Contains, s)) }
+    /// `true` where the text starts with `s`.
+    pub fn starts_with(self, s: str) -> Expr { self.unary(Node::Text(TextOp::StartsWith, s)) }
+    /// `true` where the text ends with `s`.
+    pub fn ends_with(self, s: str) -> Expr { self.unary(Node::Text(TextOp::EndsWith, s)) }
+
+    /// Running sum down the column; nulls stay null and are skipped.
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1, 2, 3] };
+    /// let u = try t.with_column("s", table::col("x").cum_sum()) catch _ { t };
+    /// assert(u.row(2).i64("s") == 6);
+    /// ```
+    pub fn cum_sum(self) -> Expr { self.unary(Node::Cum(Cum::Sum)) }
+    /// Running product; nulls stay null and are skipped.
+    pub fn cum_prod(self) -> Expr { self.unary(Node::Cum(Cum::Prod)) }
+    /// Running minimum; nulls stay null and are skipped.
+    pub fn cum_min(self) -> Expr { self.unary(Node::Cum(Cum::Min)) }
+    /// Running maximum; nulls stay null and are skipped.
+    pub fn cum_max(self) -> Expr { self.unary(Node::Cum(Cum::Max)) }
+    /// How many non-null values so far.
+    pub fn cum_count(self) -> Expr { self.unary(Node::Cum(Cum::Count)) }
+
+    /// Sum of the last `window` rows (this one included); null until
+    /// `window` values have been seen. Neumaier-compensated running sum,
+    /// O(n).
+    ///
+    /// ```nabi
+    /// let t = table::table!{ "x": [1.0, 2.0, 3.0, 4.0] };
+    /// let u = try t.with_column("r", table::col("x").rolling_mean(2)) catch _ { t };
+    /// assert(u.row(3).f64("r") == 3.5 && u.row(0).f64("r") is none);
+    /// ```
+    pub fn rolling_sum(self, window: usize) -> Expr { self.unary(Node::Roll(Roll::Sum, window, window)) }
+    /// Mean of the last `window` rows (compensated running sum).
+    pub fn rolling_mean(self, window: usize) -> Expr { self.unary(Node::Roll(Roll::Mean, window, window)) }
+    /// Minimum over the window, monotonic deque, O(n).
+    pub fn rolling_min(self, window: usize) -> Expr { self.unary(Node::Roll(Roll::Min, window, window)) }
+    /// Maximum over the window, monotonic deque, O(n).
+    pub fn rolling_max(self, window: usize) -> Expr { self.unary(Node::Roll(Roll::Max, window, window)) }
+    /// Sample standard deviation over the window (Welford update with
+    /// removal, O(n)).
+    pub fn rolling_std(self, window: usize) -> Expr { self.unary(Node::Roll(Roll::Std, window, window)) }
+
+    /// A rolling statistic that starts once `min_periods` values of the
+    /// window are present (nulls do not count).
+    pub fn rolling(self, stat: str, window: usize, min_periods: usize) -> Expr {
+        let r = match stat {
+            "sum" => Roll::Sum,
+            "min" => Roll::Min,
+            "max" => Roll::Max,
+            "std" => Roll::Std,
+            _ => Roll::Mean,
+        };
+        self.unary(Node::Roll(r, window, min_periods.max(1)))
+    }
+
+    /// The column moved down by `k` rows (up for a negative `k`), nulls
+    /// filling the gap.
+    pub fn shift(self, k: i64) -> Expr { self.unary(Node::Shift(k)) }
+
+    /// `x - x.shift(k)`.
+    pub fn diff(self, k: i64) -> Expr { bin(Op::Sub, self, self.shift(k)) }
+
+    /// `f` of each cell (nulls included), as one column; the result
+    /// type comes from the cells (`Column::from_values`).
+    ///
+    /// ```nabi
+    /// use table::Value;
+    /// let t = table::table!{ "s": ["a", "bb"] };
+    /// let e = table::col("s").map(|v| Value::Int((v.as_str() ?? "").len() as i64));
+    /// assert((try t.with_column("n", e) catch _ { t }).row(1).i64("n") == 2);
+    /// ```
+    pub fn map(self, f: fn(Value) -> Value) -> Expr { self.unary(Node::Map(f)) }
+
+    /// `f` of each non-null number, as `f64`.
+    pub fn map_f64(self, f: fn(f64) -> f64) -> Expr { self.unary(Node::MapF64(f)) }
+
+    /// The names of the columns this expression reads.
+    pub fn columns(self) -> List<str> {
+        let out: List<str> = List::new();
+        self.walk(out);
+        out
+    }
+
+    fn walk(self, out: List<str>) {
+        if let Node::Col(n) = self.node {
+            if !out.contains(n) { out.push(n); }
+        }
+        for k in self.kids {
+            k.walk(out);
+        }
+    }
+}
+
+impl Display for Expr {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let k = self.kids;
+        let s = match self.node {
+            Node::Col(n) => f"col(\"{n}\")",
+            Node::Lit(v) => match v {
+                Value::Str(s) => f"\"{s}\"",
+                Value::Date(d) => f"{d:?}",
+                Value::DateTime(t) => f"{t:?}",
+                _ => f"{v}",
+            },
+            Node::Bin(op) => f"({k[0]} {op.token()} {k[1]})",
+            Node::Neg => f"-{k[0]}",
+            Node::Not => f"!{k[0]}",
+            Node::IsNull => f"{k[0]}.is_null()",
+            Node::NotNull => f"{k[0]}.is_not_null()",
+            Node::FillNull => f"{k[0]}.fill_null({k[1]})",
+            Node::Cast(t) => f"{k[0]}.cast({t})",
+            Node::IsIn(vs) => f"{k[0]}.is_in({vs.len()} values)",
+            Node::Func(_) => f"{k[0]}.fn()",
+            Node::Text(_, s) => f"{k[0]}.text(\"{s}\")",
+            Node::When => f"when({k[0]}).then({k[1]}).otherwise({k[2]})",
+            Node::Cum(_) => f"{k[0]}.cum()",
+            Node::Roll(_, w, _) => f"{k[0]}.rolling({w})",
+            Node::Shift(n) => f"{k[0]}.shift({n})",
+            Node::Map(_) => f"{k[0]}.map(..)",
+            Node::MapF64(_) => f"{k[0]}.map_f64(..)",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Debug for Expr {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"{self}") }
+}
+
+impl ops::Neg for Expr {
+    type Output = Expr;
+    fn neg(self) -> Expr { self.unary(Node::Neg) }
+}
+
+impl ops::Not for Expr {
+    type Output = Expr;
+    fn not(self) -> Expr { self.unary(Node::Not) }
+}
+
+// The dot operators: an `Expr` on the left takes anything `IntoExpr`;
+// a scalar on the left, one impl per scalar type.
+#[impl_macro(expr_ops)] @macro {
+    (@rep[sep = ","] { @tr: ident @m: ident @op: ident }) => {
+        @for @tr {
+            impl<R: IntoExpr> ops::@tr<R> for Expr {
+                type Output = Expr;
+                fn @m(self, rhs: R) -> Expr { bin(Op::@op, self, rhs.into_expr()) }
+            }
+            impl ops::@tr<Expr> for f64 {
+                type Output = Expr;
+                fn @m(self, rhs: Expr) -> Expr { bin(Op::@op, self.into_expr(), rhs) }
+            }
+            impl ops::@tr<Expr> for i64 {
+                type Output = Expr;
+                fn @m(self, rhs: Expr) -> Expr { bin(Op::@op, self.into_expr(), rhs) }
+            }
+        }
+    }
+}
+
+expr_ops!(
+    DotAdd dot_add Add, DotSub dot_sub Sub, DotMul dot_mul Mul, DotDiv dot_div Div,
+    DotRem dot_rem Rem, DotPow dot_pow Pow,
+    DotEq dot_eq Eq, DotNe dot_ne Ne, DotLt dot_lt Lt, DotLe dot_le Le, DotGt dot_gt Gt, DotGe dot_ge Ge
+);
+
+impl<R: IntoExpr> ops::DotLogicalAnd<R> for Expr {
+    type Output = Expr;
+    fn dot_logical_and(self, rhs: R) -> Expr { bin(Op::And, self, rhs.into_expr()) }
+}
+
+impl<R: IntoExpr> ops::DotLogicalOr<R> for Expr {
+    type Output = Expr;
+    fn dot_logical_or(self, rhs: R) -> Expr { bin(Op::Or, self, rhs.into_expr()) }
+}

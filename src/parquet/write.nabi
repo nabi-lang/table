@@ -1,0 +1,329 @@
+// The Parquet writer: flat optional columns, row groups of a set size,
+// a dictionary page for `cat` columns and for `str` columns with few
+// distinct values, data pages v1 with RLE definition levels, min / max
+// statistics, and the Arrow schema in the metadata so Arrow readers get
+// the same types back.
+
+use pkg::bytes::{put_i32, put_i64, put_str, put_u32, put_u64};
+use pkg::column::Data;
+use pkg::parquet::Compression;
+use pkg::parquet::rle::{put_hybrid, width};
+use pkg::parquet::thrift::{Tf, Tv, bytes_of, f, list_of, write_struct};
+use pkg::{Column, DType, Table};
+use core::encoding::base64;
+
+/// Physical type, converted type (-1 for none) and logical type of a
+/// column.
+fn types(c: Column) -> (i64, i64, List<Tf> | none) {
+    match c.dtype() {
+        DType::I64 => (2, -1, none),
+        DType::F64 => (5, -1, none),
+        DType::Bool => (0, -1, none),
+        DType::Str | DType::Cat => (6, 0, [f(1, Tv::S(List::new()))]),
+        DType::Date => (1, 6, [f(6, Tv::S(List::new()))]),
+        DType::DateTime => (2, -1, [f(8, Tv::S([f(1, Tv::B(false)), f(2, Tv::S([f(3, Tv::S(List::new()))]))]))]),
+    }
+}
+
+fn element(name: str, c: Column) -> Tv {
+    let (pt, conv, logical) = types(c);
+    let fs = [f(1, Tv::I32(pt)), f(3, Tv::I32(1)), f(4, bytes_of(name))];
+    if conv >= 0 { fs.push(f(6, Tv::I32(conv))); }
+    if let l: List<Tf> = logical { fs.push(f(10, Tv::S(l))); }
+    Tv::S(fs)
+}
+
+/// PLAIN bytes of rows `idx` (non-null) of `c`.
+fn plain(c: Column, idx: List<usize>) -> List<u8> {
+    let b: List<u8> = List::new();
+    match c.data {
+        Data::I64(v) => for i in idx { put_i64(b, v[i]); },
+        Data::F64(v) => for i in idx { put_u64(b, v[i].to_bits()); },
+        Data::Bool(v) => {
+            let byte = 0u64;
+            for k in 0..idx.len() {
+                if v[idx[k]] { byte = byte | (1u64 << (k & 7) as u64); }
+                if k & 7 == 7 {
+                    b.push(byte as u8);
+                    byte = 0u64;
+                }
+            }
+            if idx.len() & 7 != 0 { b.push(byte as u8); }
+        },
+        Data::Str(v) => for i in idx { text(b, v[i]); },
+        Data::Cat(cs, lv) => for i in idx { text(b, lv[cs[i] as usize]); },
+        Data::Date(v) => for i in idx { put_i32(b, v[i] as i64); },
+        Data::DateTime(v) => for i in idx { put_i64(b, v[i]); },
+    }
+    b
+}
+
+fn text(b: List<u8>, s: str) {
+    put_u32(b, s.len() as u64);
+    put_str(b, s);
+}
+
+/// Min / max statistics of the non-null rows `idx`, PLAIN-encoded;
+/// none for booleans or when every value is NaN.
+fn minmax(c: Column, idx: List<usize>) -> (List<u8>, List<u8>) | none {
+    if idx.is_empty() { return none; }
+    let lo: List<u8> = List::new();
+    let hi: List<u8> = List::new();
+    match c.data {
+        // Two arms, not `I64(v) | DateTime(v)`: the or-pattern's binding
+        // is reported unused.
+        Data::I64(v) => longs(v, idx, lo, hi),
+        Data::DateTime(v) => longs(v, idx, lo, hi),
+        Data::F64(v) => {
+            let any = false;
+            let (a, z) = (0.0, 0.0);
+            for i in idx {
+                let x = v[i];
+                if x != x { continue; }
+                if !any {
+                    a = x;
+                    z = x;
+                    any = true;
+                } else {
+                    a = a.min(x);
+                    z = z.max(x);
+                }
+            }
+            if !any { return none; }
+            // -0.0 and +0.0 compare equal; write the safe signs.
+            if a == 0.0 { a = -0.0; }
+            if z == 0.0 { z = 0.0; }
+            put_u64(lo, a.to_bits());
+            put_u64(hi, z.to_bits());
+        },
+        Data::Date(v) => {
+            let (a, z) = (v[idx[0]], v[idx[0]]);
+            for i in idx {
+                a = a.min(v[i]);
+                z = z.max(v[i]);
+            }
+            put_i32(lo, a as i64);
+            put_i32(hi, z as i64);
+        },
+        Data::Str(_) | Data::Cat(_, _) => {
+            let s = |i: usize| -> str { match c.data {
+                Data::Str(v) => v[i],
+                Data::Cat(cs, lv) => lv[cs[i] as usize],
+                _ => "",
+            } };
+            let (a, z) = (s(idx[0]), s(idx[0]));
+            for i in idx {
+                let x = s(i);
+                if x < a { a = x; }
+                if x > z { z = x; }
+            }
+            put_str(lo, a);
+            put_str(hi, z);
+        },
+        Data::Bool(_) => return none,
+    }
+    (lo, hi)
+}
+
+fn longs(v: List<i64>, idx: List<usize>, lo: List<u8>, hi: List<u8>) {
+    let (a, z) = (v[idx[0]], v[idx[0]]);
+    for i in idx {
+        a = a.min(v[i]);
+        z = z.max(v[i]);
+    }
+    put_i64(lo, a);
+    put_i64(hi, z);
+}
+
+fn compress(b: List<u8>, how: Compression) -> List<u8> {
+    match how {
+        Compression::None => b,
+        Compression::Snappy => pkg::codec::snappy::compress(b, 0, b.len()),
+    }
+}
+
+fn codec(how: Compression) -> i64 {
+    match how {
+        Compression::None => 0,
+        Compression::Snappy => 1,
+    }
+}
+
+/// Append a page: its header, then its (compressed) body; gives the
+/// bytes added before and after compression.
+fn page(out: List<u8>, header: List<Tf>, body: List<u8>, how: Compression) -> (usize, usize) {
+    let c = compress(body, how);
+    let h = [f(1, header[0].v), f(2, Tv::I32(body.len() as i64)), f(3, Tv::I32(c.len() as i64))];
+    for x in header[1:header.len()].to_list() {
+        h.push(x);
+    }
+    let at = out.len();
+    write_struct(out, h);
+    let hl = out.len() - at;
+    for x in c {
+        out.push(x);
+    }
+    (hl + body.len(), hl + c.len())
+}
+
+/// The column chunk of rows `s..e` of `c`, appended to `out`; gives its
+/// ColumnChunk and uncompressed size.
+fn chunk(out: List<u8>, name: str, c: Column, s: usize, e: usize, page_rows: usize, how: Compression, dict_ok: bool) -> (Tv, usize) {
+    let start = out.len();
+    let present: List<usize> = List::new();
+    for i in s..e {
+        if c.is_valid(i) { present.push(i); }
+    }
+    let (pt, _, _) = types(c);
+    // A dictionary: the levels of a `cat` column, the distinct strings
+    // of a `str` column that repeats enough.
+    let dict: List<str> | none = none;
+    let codes: List<u32> = List::new();
+    let base = 0usize;
+    match c.data {
+        Data::Cat(cs, lv) => if dict_ok {
+            dict = lv;
+            codes = cs;
+        },
+        Data::Str(v) => if dict_ok && present.len() > 0 {
+            let seen: Dict<str, u32> = Dict::new();
+            let lv: List<str> = List::new();
+            codes = List::filled(e - s, 0u32);
+            base = s;
+            let ok = true;
+            for i in present {
+                let k = match seen.get(v[i]) {
+                    x: u32 => x,
+                    none => {
+                        let x = lv.len() as u32;
+                        lv.push(v[i]);
+                        _ = seen.insert(v[i], x);
+                        x
+                    },
+                };
+                codes[i - s] = k;
+                if 2 * lv.len() > present.len() + 16 {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok { dict = lv; }
+        },
+        _ => {},
+    }
+    let raw = 0usize;
+    let dict_off = -1i64;
+    let encs: List<Tv> = [Tv::I32(0), Tv::I32(3)];
+    if let lv: List<str> = dict {
+        dict_off = out.len() as i64;
+        let body: List<u8> = List::new();
+        for x in lv {
+            text(body, x);
+        }
+        let (r, _) = page(out, [f(1, Tv::I32(2)), f(7, Tv::S([f(1, Tv::I32(lv.len() as i64)), f(2, Tv::I32(0))]))], body, how);
+        raw += r;
+        encs.push(Tv::I32(8));
+    }
+    let data_off = out.len() as i64;
+    let ps = s;
+    while ps < e || ps == s {
+        let pe = (ps + page_rows).min(e);
+        let body: List<u8> = List::new();
+        let defs: List<u32> = List::from_fn(pe - ps, |k| if c.is_valid(ps + k) { 1u32 } else { 0u32 });
+        let lev: List<u8> = List::new();
+        put_hybrid(lev, defs, 1);
+        put_u32(body, lev.len() as u64);
+        for x in lev {
+            body.push(x);
+        }
+        let idx: List<usize> = List::new();
+        for i in ps..pe {
+            if c.is_valid(i) { idx.push(i); }
+        }
+        let enc = 0i64;
+        if let lv: List<str> = dict {
+            enc = 8;
+            let w = width((lv.len() as u64).max(1u64) - 1u64).max(1);
+            body.push(w as u8);
+            put_hybrid(body, List::from_fn(idx.len(), |k| codes[idx[k] - base]), w);
+        } else {
+            for x in plain(c, idx) {
+                body.push(x);
+            }
+        }
+        let dh = [f(1, Tv::I32((pe - ps) as i64)), f(2, Tv::I32(enc)), f(3, Tv::I32(3)), f(4, Tv::I32(3))];
+        let (r, _) = page(out, [f(1, Tv::I32(0)), f(5, Tv::S(dh))], body, how);
+        raw += r;
+        ps = pe;
+        if pe >= e { break; }
+    }
+    let md = [
+        f(1, Tv::I32(pt)),
+        f(2, list_of(encs)),
+        f(3, list_of([bytes_of(name)])),
+        f(4, Tv::I32(codec(how))),
+        f(5, Tv::I64((e - s) as i64)),
+        f(6, Tv::I64(raw as i64)),
+        f(7, Tv::I64((out.len() - start) as i64)),
+        f(9, Tv::I64(data_off)),
+    ];
+    if dict_off >= 0 { md.push(f(11, Tv::I64(dict_off))); }
+    let st = [f(3, Tv::I64(((e - s) - present.len()) as i64))];
+    if let mm: (List<u8>, List<u8>) = minmax(c, present) {
+        st.push(f(5, Tv::Bin(mm.1)));
+        st.push(f(6, Tv::Bin(mm.0)));
+    }
+    md.push(f(12, Tv::S(st)));
+    (Tv::S([f(2, Tv::I64(start as i64)), f(3, Tv::S(md))]), raw)
+}
+
+/// `t` as a Parquet file.
+pub(pkg) fn write(t: Table, group_rows: usize, page_rows: usize, how: Compression, dict: bool) -> List<u8> {
+    let out: List<u8> = List::new();
+    put_str(out, "PAR1");
+    let groups: List<Tv> = List::new();
+    let s = 0usize;
+    let ordinal = 0i64;
+    while s < t.rows {
+        let e = (s + group_rows.max(1)).min(t.rows);
+        let start = out.len();
+        let chunks: List<Tv> = List::new();
+        let raw = 0usize;
+        for k in 0..t.cols.len() {
+            let (cc, r) = chunk(out, t.names[k], t.cols[k], s, e, page_rows.max(1), how, dict);
+            chunks.push(cc);
+            raw += r;
+        }
+        groups.push(Tv::S([
+            f(1, list_of(chunks)),
+            f(2, Tv::I64(raw as i64)),
+            f(3, Tv::I64((e - s) as i64)),
+            f(5, Tv::I64(start as i64)),
+            f(6, Tv::I64((out.len() - start) as i64)),
+            f(7, Tv::I16(ordinal)),
+        ]));
+        ordinal += 1;
+        s = e;
+    }
+    let schema: List<Tv> = [Tv::S([f(4, bytes_of("schema")), f(5, Tv::I32(t.cols.len() as i64))])];
+    for k in 0..t.cols.len() {
+        schema.push(element(t.names[k], t.cols[k]));
+    }
+    let arrow = base64::encode(pkg::arrow::write::schema_message(t));
+    let kv = Tv::S([f(1, bytes_of("ARROW:schema")), f(2, bytes_of(arrow))]);
+    let orders: List<Tv> = List::from_fn(t.cols.len(), |_| Tv::S([f(1, Tv::S(List::new()))]));
+    let fm = [
+        f(1, Tv::I32(2)),
+        f(2, list_of(schema)),
+        f(3, Tv::I64(t.rows as i64)),
+        f(4, list_of(groups)),
+        f(5, list_of([kv])),
+        f(6, bytes_of("nabi table 0.1.0")),
+    ];
+    if !orders.is_empty() { fm.push(f(7, list_of(orders))); }
+    let at = out.len();
+    write_struct(out, fm);
+    put_u32(out, (out.len() - at) as u64);
+    put_str(out, "PAR1");
+    out
+}

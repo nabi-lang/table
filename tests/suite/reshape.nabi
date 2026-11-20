@@ -1,0 +1,89 @@
+// Pivot, melt, describe, value counts, nulls.
+
+use pkg::{AggKind, DType, Table, Value};
+
+#[test]
+fn pivot_wide() {
+    let t = pkg::table!{
+        "day": ["mon", "mon", "tue", "tue", "mon", "wed"],
+        "city": ["A", "B", "A", "A", "A", "C"],
+        "temp": [20.0, 25.0, 22.0, 24.0, 18.0, 30.0],
+    };
+    let p = try t.pivot(["day"], "city", "temp", AggKind::Mean) catch e { panic(f"{e}"); };
+    assert(p.names() == ["day", "A", "B", "C"]);
+    assert(p.column_at(1).to_options_f64() == [19.0, 23.0, none]);
+    assert(p.column_at(2).to_options_f64() == [25.0, none, none]);
+    let c = try t.pivot(["day"], "city", "temp", AggKind::Count) catch e { panic(f"{e}"); };
+    assert(c.column_at(1).to_options_i64() == [2, 2, none]);
+    let custom = try t.pivot(["day"], "city", "temp", AggKind::Custom).nrows() as i64 catch e {
+        assert(e.message().contains("built-in aggregation"));
+        -1
+    };
+    assert(custom == -1);
+    let e = try t.head(0).pivot(["day"], "city", "temp", AggKind::Sum) catch e2 { panic(f"{e2}"); };
+    assert(e.shape() == (0, 1));
+}
+
+#[test]
+fn melt_long() {
+    let t = pkg::table!{ "id": [1, 2], "a": [10, 20], "b": [1.5, none] };
+    let m = try t.melt(["id"], none) catch e { panic(f"{e}"); };
+    assert(m.names() == ["id", "variable", "value"]);
+    assert(m.column_at(0).to_options_i64() == [1, 2, 1, 2]);
+    assert(m.column_at(1).to_options_str() == ["a", "a", "b", "b"]);
+    assert(m.column_at(2).dtype() == DType::F64);
+    assert(m.column_at(2).to_options_f64() == [10.0, 20.0, 1.5, none]);
+    let only = try t.melt([], ["a"]) catch e { panic(f"{e}"); };
+    assert(only.names() == ["variable", "value"] && only.nrows() == 2);
+    let mixed = pkg::table!{ "id": [1], "s": ["x"], "n": [1] };
+    let bad = try mixed.melt(["id"], none).nrows() as i64 catch _ { -1 };
+    assert(bad == -1);
+    // Round trip: melt then pivot back.
+    let back = try m.pivot(["id"], "variable", "value", AggKind::First) catch e { panic(f"{e}"); };
+    assert(back.names() == ["id", "a", "b"] && back.column_at(2).to_options_f64() == [1.5, none]);
+}
+
+#[test]
+fn describe_stats() {
+    let t = pkg::table!{ "x": [1.0, 2.0, 3.0, 4.0, none, f64::NAN], "n": [1, 1, 1, 1, 1, 7], "s": ["a", "b", "c", "d", "e", "f"] };
+    let d = t.describe();
+    assert(d.names() == ["stat", "x", "n"]);
+    assert(d.column_at(0).to_options_str() == ["count", "null_count", "mean", "std", "min", "25%", "50%", "75%", "max"]);
+    let x = d.column_at(1).to_options_f64();
+    assert(x[0] == 4.0 && x[1] == 2.0 && x[2] == 2.5 && x[4] == 1.0 && x[5] == 1.75 && x[6] == 2.5 && x[8] == 4.0);
+    assert(((x[3] ?? 0.0) - (5.0f64 / 3.0).sqrt()).abs() < 1e-12);
+    let e = pkg::table!{ "x": [1.0] }.head(0).describe();
+    assert(e.column_at(1).to_options_f64()[2] is none);
+    assert(Table::new().describe().names() == ["stat"]);
+}
+
+#[test]
+fn counts() {
+    let t = pkg::table!{ "c": ["x", "y", "x", none, "y", "x", none, none, none] };
+    let v = try t.value_counts("c") catch e { panic(f"{e}"); };
+    assert(v.column_at(0).to_options_str() == [none, "x", "y"]);
+    assert(v.column_at(1).to_options_i64() == [4, 3, 2]);
+    let ab = pkg::table!{ "a": [1, none], "b": ["x", "y"] };
+    let n = ab.null_counts();
+    assert(n.column_at(1).to_options_i64() == [1, 0]);
+}
+
+#[test]
+fn fill_and_drop_nulls() {
+    let t = pkg::table!{ "a": [1, none, 3, none], "b": ["x", "y", none, none] };
+    assert((try t.drop_nulls(none) catch _ { t }).nrows() == 1);
+    assert((try t.drop_nulls(["a"]) catch _ { t }).nrows() == 2);
+    let f = try t.fill_null("a", Value::Int(0)) catch e { panic(f"{e}"); };
+    assert(f.column_at(0).to_options_i64() == [1, 0, 3, 0]);
+    assert(f.column_at(0).null_count() == 0);
+    let wrong = try t.fill_null("a", Value::Str("z")).nrows() as i64 catch e {
+        assert(e.message().contains("column `a` is i64, so it cannot be filled with a str value"), e.message());
+        -1
+    };
+    assert(wrong == -1);
+    let ff = try t.fill_forward("b") catch e { panic(f"{e}"); };
+    assert(ff.column_at(1).to_options_str() == ["x", "y", "y", "y"]);
+    let xs = pkg::table!{ "x": [none, 2.0] };
+    let fl = try xs.fill_null("x", Value::Int(1)) catch e { panic(f"{e}"); };
+    assert(fl.column_at(0).to_options_f64() == [1.0, 2.0]);
+}

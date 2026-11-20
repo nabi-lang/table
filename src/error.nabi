@@ -1,0 +1,115 @@
+//! The one error type. Every message says what went wrong and what to
+//! write instead.
+
+/// What went wrong in a table operation.
+///
+/// ```nabi
+/// let t = table::table!{ "name": ["a", "b"] };
+/// let c = try t.column("nmae") catch e {
+///     assert(f"{e}".contains("did you mean `name`"));
+///     return;
+/// };
+/// panic(f"found {c}");
+/// ```
+#[derive(Clone, PartialEq)]
+pub enum TableError {
+    /// No column of that name; `closest` is the nearest existing name.
+    MissingColumn { name: str; closest: str | none; },
+    /// Two columns would share a name.
+    DuplicateColumn { name: str; },
+    /// A column holds another type than the operation needs.
+    TypeMismatch { column: str; expected: str; found: str; },
+    /// A column's length differs from the table's.
+    LengthMismatch { column: str; len: usize; expected: usize; },
+    /// Row `row` (0-based) has `len` cells where the table has `expected` columns.
+    RaggedRow { row: usize; len: usize; expected: usize; },
+    /// Text that does not read as a table: CSV / JSON lines input.
+    Parse { line: usize; col: usize; msg: str; },
+    /// A read or write failed.
+    Io { msg: str; },
+    /// An argument outside what the operation accepts.
+    Invalid { msg: str; },
+    /// A binary file (`format` is "arrow" or "parquet") that is
+    /// malformed, or uses a feature this package does not read.
+    Format { format: str; msg: str; },
+}
+
+impl TableError {
+    /// The message, as `Display` writes it.
+    pub fn message(self) -> str { f"{self}" }
+
+    pub(pkg) fn invalid(msg: str) -> TableError { TableError::Invalid { msg } }
+
+    pub(pkg) fn mismatch(column: str, expected: str, found: str) -> TableError {
+        TableError::TypeMismatch { column, expected, found }
+    }
+
+    /// A missing `name` among `names`, with the closest suggested.
+    pub(pkg) fn missing(name: str, names: List<str>) -> TableError {
+        TableError::MissingColumn { name, closest: closest(name, names) }
+    }
+}
+
+impl Display for TableError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            TableError::MissingColumn { name, closest } => match closest {
+                c: str => f"no column `{name}`; did you mean `{c}`?",
+                none => f"no column `{name}`; `t.names()` lists the columns",
+            },
+            TableError::DuplicateColumn { name } =>
+                f"column `{name}` already exists; pick another name or `drop` the old column first",
+            TableError::TypeMismatch { column, expected, found } =>
+                f"column `{column}` is {found}, but {expected} is needed here; convert it with `t.cast(\"{column}\", DType::...)`",
+            TableError::LengthMismatch { column, len, expected } =>
+                f"column `{column}` has {len} values but the table has {expected} rows; give every column the same length",
+            TableError::RaggedRow { row, len, expected } =>
+                f"row {row} has {len} values but there are {expected} columns; give every row one value per column (`none` for a missing one)",
+            TableError::Parse { line, col, msg } => if col > 0 { f"{line}:{col}: {msg}" } else { f"line {line}: {msg}" },
+            TableError::Io { msg } => msg,
+            TableError::Invalid { msg } => msg,
+            TableError::Format { format, msg } => f"{format}: {msg}",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Debug for TableError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"TableError({self})") }
+}
+
+impl Error for TableError {}
+
+/// The name in `names` nearest to `name` by edit distance, when it is
+/// near enough to be a likely typo (at most a third of the length).
+pub(pkg) fn closest(name: str, names: List<str>) -> str | none {
+    let best: str | none = none;
+    let best_d = name.chars().count() / 3 + 1;
+    for n in names {
+        let d = edit_distance(name.to_lowercase(), n.to_lowercase());
+        if d < best_d || (d == best_d && best is none && d <= 2) {
+            best_d = d;
+            best = n;
+        }
+    }
+    best
+}
+
+/// Levenshtein distance over code points, two rows.
+pub(pkg) fn edit_distance(a: str, b: str) -> usize {
+    let ac: List<char> = a.chars().collect();
+    let bc: List<char> = b.chars().collect();
+    let prev: List<usize> = List::from_fn(bc.len() + 1, |j| j);
+    let cur: List<usize> = List::filled(bc.len() + 1, 0);
+    for i in 0..ac.len() {
+        cur[0] = i + 1;
+        for j in 0..bc.len() {
+            let sub = prev[j] + if ac[i] == bc[j] { 0 } else { 1 };
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        for j in 0..cur.len() {
+            prev[j] = cur[j];
+        }
+    }
+    prev[bc.len()]
+}

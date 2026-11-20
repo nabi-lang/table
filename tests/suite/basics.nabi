@@ -1,0 +1,226 @@
+// Construction, selection, slicing, rows, errors.
+
+use pkg::{Column, DType, Table, TableError, Value};
+use core::array::Array;
+
+/// The message of the error `f` throws; "" when it does not.
+fn error_of<T>(f: fn() throws (TableError) -> T) -> str {
+    try f() catch e { return e.message(); };
+    ""
+}
+
+#[test]
+fn literal_types() {
+    let t = pkg::table!{ "id": [1, 2, 3], "x": [0.5, none, 2.0], "s": ["a", "b", "a"], "b": [true, false, none], "d": [date"2024-01-01", none, date"2024-03-01"] };
+    assert_eq(t.shape(), (3, 5));
+    assert(t.dtypes() == [DType::I64, DType::F64, DType::Str, DType::Bool, DType::Date]);
+    assert_eq(t.column_at(1).null_count(), 1);
+    assert_eq(t.column_at(3).null_count(), 1);
+    assert(t.row(2).get("d") == Value::Date(date"2024-03-01"));
+    // An int and a float in one column read as f64.
+    let m = pkg::table!{ "n": [1, 2.5] };
+    assert(m.column_at(0).dtype() == DType::F64);
+    // Trailing commas, a null first, a postfix on the literal.
+    let w = pkg::table!{
+        "a": [none, 2.5,],
+        "b": ["x", none,],
+    };
+    assert(w.dtypes() == [DType::F64, DType::Str] && w.column_at(0).null_count() == 1);
+    assert(pkg::table!{ "x": [1, 2, 3] }.nrows() == 3);
+    assert(pkg::column![1, none, 3,].null_count() == 1);
+    let xs: List<f64 | none> = [0.5, none];
+    assert(Column::from(xs) == pkg::column![0.5, none, 1.0].slice(0, 2));
+}
+
+#[test]
+fn from_columns_and_rows() {
+    let t = try Table::from_columns([("a", Column::from([1, 2])), ("b", Column::from(["x", "y"]))]) catch e { panic(f"{e}"); };
+    assert_eq(t.names(), ["a", "b"]);
+    let msg = error_of(|| try Table::from_columns([("a", Column::from([1, 2])), ("b", Column::from([1]))]));
+    assert(msg.contains("has 1 values but the table has 2 rows"), msg);
+    let d = try? Table::from_columns([("a", Column::from([1])), ("a", Column::from([2]))]);
+    assert(d is none);
+    let r = try Table::from_rows(["a", "b"], [[Value::Int(1), Value::Str("x")], [Value::Null, Value::Str("y")]]) catch e { panic(f"{e}"); };
+    assert(r.column_at(0).dtype() == DType::I64 && r.column_at(0).null_count() == 1);
+    let rag = error_of(|| try Table::from_rows(["a", "b"], [[Value::Int(1), Value::Int(2)], [Value::Int(3)]]));
+    assert(rag.contains("row 1 has 1 values but there are 2 columns"), rag);
+    let mixed = error_of(|| try Table::from_rows(["a"], [[Value::Int(1)], [Value::Str("x")]]));
+    assert(mixed.contains("column `a`") && mixed.contains("i64 and str"), mixed);
+}
+
+#[derive(pkg::Record)]
+struct Trade {
+    sym: str;
+    qty: i64;
+    px: f64 | none;
+    day: pkg::Date;
+}
+
+#[test]
+fn records() {
+    let t = pkg::record_table([
+        Trade { sym: "A", qty: 1, px: 1.5, day: date"2024-01-02" },
+        Trade { sym: "B", qty: 2, px: none, day: date"2024-01-03" },
+    ]);
+    assert(t.names() == ["sym", "qty", "px", "day"]);
+    assert(t.dtypes() == [DType::Str, DType::I64, DType::F64, DType::Date]);
+    assert(t.row(1).f64("px") is none);
+    let empty = pkg::record_table::<Trade>([]);
+    assert(empty.shape() == (0, 4));
+    assert(empty.column_at(2).dtype() == DType::F64);
+}
+
+#[test]
+fn missing_column_suggests() {
+    let t = pkg::table!{ "price": [1.0], "quantity": [2] };
+    let e = error_of(|| try t.column("prise"));
+    assert(e == "no column `prise`; did you mean `price`?", e);
+    let far = error_of(|| try t.column("zzzzzz"));
+    assert(far.contains("`t.names()` lists the columns"), far);
+    let sel = error_of(|| try t.select(["quantity", "pirce"]));
+    assert(sel.contains("did you mean `price`"), sel);
+}
+
+#[test]
+fn type_errors_name_both_types() {
+    let t = pkg::table!{ "price": [1.0], "n": ["a"] };
+    let m = error_of(|| try t.i64("price"));
+    assert(m.contains("column `price` is f64, but i64 is needed"), m);
+    let g = error_of(|| try (try t.group_by(["n"])).agg([pkg::sum("n")]));
+    assert(g.contains("column `n` is str, but a number is needed"), g);
+    let f = error_of(|| try t.filter(pkg::col("n")));
+    assert(f.contains("is str, but filtering needs bool"), f);
+}
+
+#[test]
+fn select_drop_rename() {
+    let t = pkg::table!{ "a": [1], "b": [2], "c": [3] };
+    assert((try t.select(["c", "a"]) catch _ { t }).names() == ["c", "a"]);
+    assert((try t.drop(["b"]) catch _ { t }).names() == ["a", "c"]);
+    assert((try t.rename([("a", "x"), ("c", "z")]) catch _ { t }).names() == ["x", "b", "z"]);
+    assert((try? t.rename([("a", "b")])) is none);
+    assert((try? t.drop(["q"])) is none);
+    assert((try? t.select(["a", "a"])) is none);
+    assert(t.names() == ["a", "b", "c"]);
+}
+
+#[test]
+fn slicing() {
+    let t = pkg::table!{ "x": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] };
+    assert(t.head(3).column_at(0).to_options_i64() == [0, 1, 2]);
+    assert(t.tail(2).column_at(0).to_options_i64() == [8, 9]);
+    assert(t.slice(4, 6).column_at(0).to_options_i64() == [4, 5]);
+    assert(t.slice(8, 100).nrows() == 2);
+    assert(t.slice(20, 30).nrows() == 0);
+    assert(t.head(0).nrows() == 0 && t.tail(50).nrows() == 10);
+    assert((try t.take([9, 0, 9]) catch _ { t }).column_at(0).to_options_i64() == [9, 0, 9]);
+    assert((try? t.take([10])) is none);
+    let s = t.sample(4, 42);
+    assert(s.nrows() == 4);
+    assert(t.sample(4, 42).column_at(0).to_options_i64() == s.column_at(0).to_options_i64());
+    let all = t.sample(100, 1).column_at(0).to_options_i64();
+    let sorted: List<i64> = all.iter().map(|x| x ?? 0).collect();
+    sorted.sort();
+    assert(sorted == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert(Table::new().sample(3, 1).nrows() == 0);
+}
+
+#[test]
+fn rows_and_cells() {
+    let t = pkg::table!{ "a": [1, 2], "b": ["x", none] };
+    let r = t.row(1);
+    assert(r.index() == 1 && r.i64("a") == 2 && r.str("b") == "" && r.get("b") == Value::Null);
+    assert(r.get("nope") == Value::Null);
+    assert(r.values() == [Value::Int(2), Value::Null]);
+    assert(t.rows().len() == 2);
+    assert((try t.get(0, "b") catch _ { Value::Null }) == Value::Str("x"));
+    assert((try? t.get(5, "b")) is none);
+}
+
+#[test]
+fn stacking() {
+    let a = pkg::table!{ "x": [1], "y": ["a"] };
+    let b = pkg::table!{ "y": ["b"], "x": [2.5] };
+    let v = try a.vstack(b) catch e { panic(f"{e}"); };
+    assert(v.column_at(0).dtype() == DType::F64 && v.nrows() == 2);
+    assert((try? a.vstack(pkg::table!{ "x": [1] })) is none);
+    assert((try? a.vstack(pkg::table!{ "x": [1], "z": ["q"] })) is none);
+    let h = try a.hstack(pkg::table!{ "z": [true] }) catch e { panic(f"{e}"); };
+    assert(h.names() == ["x", "y", "z"]);
+    assert((try? a.hstack(pkg::table!{ "x": [3] })) is none);
+    let c = try Table::concat([a, a, a]) catch e { panic(f"{e}"); };
+    assert(c.nrows() == 3);
+    assert((try Table::concat([]) catch _ { a }).nrows() == 0);
+    // Categorical columns with different levels stack by text.
+    let p = try Table::from_columns([("c", Column::cat(["u", "v"]))]) catch _ { a };
+    let q = try Table::from_columns([("c", Column::cat(["w", "u"]))]) catch _ { a };
+    let pq = try p.vstack(q) catch e { panic(f"{e}"); };
+    assert(pq.column_at(0).dtype() == DType::Cat);
+    assert(pq.column_at(0).to_options_str() == ["u", "v", "w", "u"]);
+    assert(pq.column_at(0).levels() == ["u", "v", "w"]);
+}
+
+#[test]
+fn unique_rows() {
+    let t = pkg::table!{ "a": [1, 1, 2, 1, none, none], "b": ["x", "x", "y", "z", "q", "q"] };
+    let u = t.unique();
+    assert(u.nrows() == 4);
+    assert(u.column_at(1).to_options_str() == ["x", "y", "z", "q"]);
+    let ub = try t.unique_by(["a"]) catch e { panic(f"{e}"); };
+    assert(ub.column_at(0).to_options_i64() == [1, 2, none]);
+    assert(Table::new().unique().nrows() == 0);
+}
+
+#[test]
+fn columns_and_arrays() {
+    let c = Column::from([1.0, 2.0, 3.0]);
+    let a = try c.to_f64() catch _ { [0.0] };
+    assert(a.sum() == 6.0);
+    let back = Column::from_array(a .* 2.0);
+    assert(back.get(2) == Value::Float(6.0));
+    let n = pkg::column![1.0, none];
+    assert((try n.to_f64() catch _ { [0.0] })[1].is_nan());
+    // A contiguous array and its column share one buffer; a strided
+    // view is copied.
+    let src: Array<f64, 1> = [1.0, 2.0, 3.0, 4.0];
+    let shared = Column::from_array(src);
+    src[0] = 9.0;
+    assert(shared.get(0) == Value::Float(9.0));
+    let view = try shared.to_f64() catch _ { [0.0] };
+    assert(view.as_list() is List<f64>);
+    let odd = Column::from_array(src[::2]);
+    src[2] = -1.0;
+    assert(odd.len() == 2 && odd.get(1) == Value::Float(3.0));
+    assert((try? Column::from(["a"]).to_f64()) is none);
+    let i = Column::from([1, 2]);
+    assert((try i.to_i64() catch _ { [0] }).sum() == 3);
+    let cat = Column::cat(["b", "a", "b", "c"]);
+    assert(cat.levels() == ["b", "a", "c"] && cat.get(2) == Value::Str("b"));
+    assert((try cat.to_strs() catch _ { [] }) == ["b", "a", "b", "c"]);
+    assert(Column::nulls(DType::Str, 3).null_count() == 3);
+    let v = try Column::from_values([Value::Int(1), Value::Null], none) catch _ { Column::nulls(DType::F64, 0) };
+    assert(v.dtype() == DType::I64);
+}
+
+#[test]
+fn casts() {
+    let s = Column::from(["1", "2", "x"]);
+    let e = error_of(|| try s.cast(DType::I64));
+    assert(e.contains("row 2"), e);
+    let f = try Column::from(["1.5", "nan", "-inf"]).cast(DType::F64) catch _ { s };
+    assert(f.dtype() == DType::F64);
+    let i = try Column::from([1.9, -1.9]).cast(DType::I64) catch _ { s };
+    assert(i.to_options_i64() == [1, -1]);
+    assert((try? Column::from([f64::NAN]).cast(DType::I64)) is none);
+    let txt = try Column::from([1, 2]).cast(DType::Str) catch _ { s };
+    assert(txt.to_options_str() == ["1", "2"]);
+    let d = try Column::from(["2024-02-29"]).cast(DType::Date) catch _ { s };
+    assert(d.get(0) == Value::Date(date"2024-02-29"));
+    let dt = try d.cast(DType::DateTime) catch _ { s };
+    assert(dt.get(0) == Value::DateTime(datetime"2024-02-29T00:00:00"));
+    assert((try? Column::from([true]).cast(DType::Date)) is none);
+    let b = try Column::from(["true", "FALSE"]).cast(DType::Bool) catch _ { s };
+    assert(b.get(1) == Value::Bool(false));
+    let c = try Column::from([3, 1, 3]).cast(DType::Cat) catch _ { s };
+    assert(c.dtype() == DType::Cat && c.levels() == ["3", "1"]);
+}

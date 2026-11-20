@@ -1,0 +1,154 @@
+//! JSON lines: one JSON object per line, a row each. Columns are the
+//! keys in order of first appearance (a key a row leaves out is null);
+//! integers that fit become `i64`, other numbers `f64`, nested arrays
+//! and objects their JSON text.
+
+use pkg::column::Builder;
+use pkg::{DType, Table, TableError, Value};
+use std::fs;
+
+/// A table from JSON lines text; blank lines are skipped.
+///
+/// ```nabi
+/// let t = try table::read_jsonl_str("{\"a\": 1, \"b\": \"x\"}\n{\"a\": 2.5}\n") catch _ { table::Table::new() };
+/// assert(t.names() == ["a", "b"]);
+/// assert(t.column_at(0).dtype() == table::DType::F64);
+/// assert(t.row(1).get("b") == table::Value::Null);
+/// ```
+pub fn read_jsonl_str(s: str) throws (TableError) -> Table {
+    let names: List<str> = List::new();
+    let pos: Dict<str, usize> = Dict::new();
+    let cells: List<List<Value>> = List::new();
+    let rows: usize = 0;
+    let line: usize = 0;
+    for text in s.lines() {
+        line += 1;
+        let t = text.trim();
+        if t.is_empty() { continue; }
+        let v = try json::parse(t) catch e { throw TableError::Parse { line, col: e.col() as usize, msg: e.message() }; };
+        let m = match v {
+            json::Value::Object(m) => m,
+            _ => throw TableError::Parse { line, col: 1, msg: f"each line must be a JSON object, found {v.kind()}; wrap the value as {{\"value\": ..}}" },
+        };
+        for (k, x) in m {
+            let j = match pos.get(k) {
+                j: usize => j,
+                none => {
+                    let j = names.len();
+                    names.push(k);
+                    _ = pos.insert(k, j);
+                    cells.push(List::filled(rows, Value::Null));
+                    j
+                },
+            };
+            cells[j].push(cell(x));
+        }
+        rows += 1;
+        for c in cells {
+            if c.len() < rows { c.push(Value::Null); }
+        }
+    }
+    let out = Table::new();
+    for k in 0..names.len() {
+        let vs = cells[k];
+        let dt = kind_of(vs);
+        let b = Builder::new(dt, vs.len());
+        for v in vs {
+            let w = if dt == DType::F64 { match v { Value::Int(n) => Value::Float(n as f64), _ => v } } else if dt == DType::Str { text_of(v) } else { v };
+            try b.push(w);
+        }
+        out = try out.set_column(names[k], try b.finish(), false);
+    }
+    out
+}
+
+/// The JSON lines file at `path` as a table.
+///
+/// ```nabi norun
+/// let t = try "events.jsonl" |> table::read_jsonl;
+/// ```
+pub fn read_jsonl(path: str) throws (TableError) -> Table {
+    let s = try fs::read_to_str(path) catch e { throw TableError::Io { msg: f"cannot read `{path}`: {e}" }; };
+    try read_jsonl_str(s)
+}
+
+fn cell(x: json::Value) -> Value {
+    match x {
+        json::Value::Null => Value::Null,
+        json::Value::Bool(b) => Value::Bool(b),
+        json::Value::Int(n) => match n.to_i64() {
+            v: i64 => Value::Int(v),
+            none => Value::Float(n.to_f64()),
+        },
+        json::Value::Float(f) => Value::Float(f),
+        json::Value::Str(s) => Value::Str(s),
+        _ => Value::Str(x.to_str()),
+    }
+}
+
+/// One type for a column's cells: numbers mixed give `f64`; other
+/// mixes give `str`.
+fn kind_of(vs: List<Value>) -> DType {
+    let t: DType | none = none;
+    for v in vs {
+        if let d: DType = v.dtype() {
+            t = match t {
+                none => d,
+                x: DType => if x == d { x } else if x.is_numeric() && d.is_numeric() { DType::F64 } else { DType::Str },
+            };
+        }
+    }
+    t ?? DType::Str
+}
+
+fn text_of(v: Value) -> Value {
+    match v {
+        Value::Null => Value::Null,
+        Value::Str(_) => v,
+        _ => Value::Str(f"{v}"),
+    }
+}
+
+/// Row `i` of `t` as a JSON object (dates as ISO text, NaN and
+/// infinities as null).
+pub fn row_json(t: Table, i: usize) -> json::Value {
+    let m: Dict<str, json::Value> = Dict::new();
+    for k in 0..t.cols.len() {
+        let v = t.cols[k].get(i);
+        _ = m.insert(t.names[k], match v {
+            Value::Null => json::Value::Null,
+            Value::Int(n) => json::Value::Int(Int::from(n)),
+            Value::Float(x) => if x.is_finite() { json::Value::Float(x) } else { json::Value::Null },
+            Value::Bool(b) => json::Value::Bool(b),
+            Value::Str(s) => json::Value::Str(s),
+            Value::Date(d) => json::Value::Str(f"{d}"),
+            Value::DateTime(x) => json::Value::Str(f"{x}"),
+        });
+    }
+    json::Value::Object(m)
+}
+
+/// The table as JSON lines, one object per row, each line ended by `\n`.
+///
+/// ```nabi
+/// let t = table::table!{ "a": [1, none], "b": ["x", "y"] };
+/// assert(table::write_jsonl_str(t) == "{\"a\":1,\"b\":\"x\"}\n{\"a\":null,\"b\":\"y\"}\n");
+/// ```
+pub fn write_jsonl_str(t: Table) -> str {
+    let out = StrBuf::new();
+    for i in 0..t.rows {
+        json::write::value(out, row_json(t, i), 0, 0);
+        out.push('\n');
+    }
+    out.to_str()
+}
+
+/// Write the table as JSON lines to `path`.
+///
+/// ```nabi norun
+/// let t = table::table!{ "a": [1, none] };
+/// try t |> table::write_jsonl("out.jsonl");
+/// ```
+pub fn write_jsonl(t: Table, path: str) throws (TableError) {
+    try fs::write(path, write_jsonl_str(t)) catch e { throw TableError::Io { msg: f"cannot write `{path}`: {e}" }; };
+}
