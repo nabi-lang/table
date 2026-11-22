@@ -1,6 +1,6 @@
 Package {
     name: "table",
-    version: "0.1.1",
+    version: "0.1.2",
     nabi_version: "0.1.0",
     toolchain: "0.1",
     description: "Column-oriented tables: typed columns with nulls, CSV, JSON lines, Arrow IPC and Parquet I/O, expressions, group-by, joins, reshaping, lazy queries",

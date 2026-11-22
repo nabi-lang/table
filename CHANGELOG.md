@@ -2,11 +2,17 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
-## 0.1.1 (2026-11-22)
+## 0.1.2 (2026-11-22)
 
 - The package docs open with the data analysis tutorial (`table`,
-  `stats`, `plot`), moved here from the Nabi docs site; each step is a
-  doc test.
+  `stats`, `plot`), moved here from the Nabi docs site. Each step is a
+  doc test except the plot, which is shown only: `plot` depends on
+  `table`, so `table`'s tests cannot use it.
+
+## 0.1.1 (2026-11-22)
+
+Tagged, not published: its doc tests depended on `plot`, which depends
+on `table`, and publishing refused the cycle.
 
 ## 0.1.0 (2026-11-21)
 
