@@ -2,6 +2,12 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
+## 0.1.3 (2026-11-22)
+
+- Builds in a graph that also holds the `csv` package under its own
+  name: the re-export of the `csv` module no longer resolves to that
+  package.
+
 ## 0.1.2 (2026-11-22)
 
 - The package docs open with the data analysis tutorial (`table`,
