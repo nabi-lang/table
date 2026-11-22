@@ -20,11 +20,10 @@
 //! The data: daily readings from three weather stations over a week.
 //! `table::read_csv` reads a file and works out each column's type from its
 //! values; `table::read_csv_str` does the same for text already in memory.
-//! Here the script writes the file first, so it runs anywhere.
+//! Here the data is in the script, so it runs anywhere; for a file, write
+//! `table::read_csv("weather.csv")`.
 //!
 //! ```nabi
-//! use std::{env, fs, process};
-//!
 //! let csv = "day,station,temp,rain
 //! 1,north,12.5,3.0
 //! 1,south,18.0,0.0
@@ -39,13 +38,9 @@
 //! 4,south,20.5,0.0
 //! 4,east,16.0,1.0
 //! ";
-//! let path = env::temp_dir() / f"weather_{process::id()}.csv";
-//! try fs::write(path, csv);
-//!
-//! let t = try table::read_csv(path.as_str());
+//! let t = try table::read_csv_str(csv);
 //! println(t.shape());
 //! println(t.head(4));
-//! try fs::remove_file(path);
 //! # assert(t.shape() == (12, 4));
 //! # assert(t.names() == ["day", "station", "temp", "rain"]);
 //! # assert((try t.column("rain")).null_count() == 1);
@@ -210,14 +205,15 @@
 //!
 //! let r = try stats::ttest_ind(south, north);
 //! println(f"t = {r.statistic:.2}, p = {r.pvalue:.5}");
-//! println(f"south is warmer by {r.estimate:.2} C, 95% interval {r.ci(0.95)}");
+//! let ci = r.ci(0.95);
+//! println(f"south is warmer by {r.estimate:.2} C, 95% interval [{ci.lo:.2}, {ci.hi:.2}]");
 //! # assert(f"{r.statistic:.2} {r.pvalue:.5} {r.estimate:.2}" == "7.68 0.00036 6.62");
-//! # assert(f"{r.ci(0.95)}" == "[4.474617987003727, 8.775382012996273]");
+//! # assert(f"{ci.lo:.2} {ci.hi:.2}" == "4.47 8.78");
 //! ```
 //!
 //! ```text
 //! t = 7.68, p = 0.00036
-//! south is warmer by 6.62 C, 95% interval [4.474617987003727, 8.775382012996273]
+//! south is warmer by 6.62 C, 95% interval [4.47, 8.78]
 //! ```
 //!
 //! A p-value this small says that two stations with equal means would
@@ -287,10 +283,10 @@ mod bytes;
 mod codec;
 mod keys;
 
+pub use pkg::csv::{Csv, CsvReader, read_csv, read_csv_str, write_csv};
 pub use arrow::{Arrow, arrow_schema, read_arrow, write_arrow};
 pub use build::{Record, ToValue, record_table};
 pub use column::Column;
-pub use pkg::csv::{Csv, CsvReader, read_csv, read_csv_str, write_csv};
 pub use date::{Date, DateTime};
 pub use error::TableError;
 pub use expr::{Expr, IntoExpr, Then, When, col, lit, when};
