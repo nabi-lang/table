@@ -12,4 +12,9 @@ Package {
         "csvio": Dep::path("../csv", version: "^0.1", package: "csv"),
         "json": Dep::path("../json", version: "^0.1"),
     },
+    dev_deps: {
+        "plot": Dep::path("../plot", version: "^0.1"),
+        // `stats` would clash with the module of that name.
+        "stats_pkg": Dep::path("../stats", version: "^0.1", package: "stats"),
+    },
 }

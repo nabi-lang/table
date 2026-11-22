@@ -3,6 +3,271 @@
 //! dictionary-encoded str, date, datetime) plus a validity bitmap for
 //! nulls. Operations run a column at a time; grouping and joins hash
 //! rows into integer keys first (`keys`), so no per-row allocation.
+//!
+//! # Tutorial: a first data analysis
+//!
+//! This tutorial takes a small data set from a CSV file to numbers and a
+//! plot: read it with `table`, clean it, group and summarize it, test a
+//! difference with `stats`, and draw it with `plot`. Each step is a
+//! complete script; run any of them with `nabi run file.nabi`.
+//!
+//! `table`, `stats` and `plot` are official packages, so a script can use
+//! them without `nabi add`: the first `nabi run` adds each one it finds and
+//! says so (`Added table ^0.1 (official)`).
+//!
+//! ## Read a CSV file
+//!
+//! The data: daily readings from three weather stations over a week.
+//! `table::read_csv` reads a file and works out each column's type from its
+//! values; `table::read_csv_str` does the same for text already in memory.
+//! Here the script writes the file first, so it runs anywhere.
+//!
+//! ```nabi
+//! use std::{env, fs, process};
+//!
+//! let csv = "day,station,temp,rain
+//! 1,north,12.5,3.0
+//! 1,south,18.0,0.0
+//! 1,east,15.0,0.5
+//! 2,north,13.5,1.5
+//! 2,south,19.5,0.0
+//! 2,east,14.0,2.0
+//! 3,north,11.0,
+//! 3,south,17.5,4.5
+//! 3,east,15.5,0.0
+//! 4,north,12.0,6.0
+//! 4,south,20.5,0.0
+//! 4,east,16.0,1.0
+//! ";
+//! let path = env::temp_dir() / f"weather_{process::id()}.csv";
+//! try fs::write(path, csv);
+//!
+//! let t = try table::read_csv(path.as_str());
+//! println(t.shape());
+//! println(t.head(4));
+//! try fs::remove_file(path);
+//! # assert(t.shape() == (12, 4));
+//! # assert(t.names() == ["day", "station", "temp", "rain"]);
+//! # assert((try t.column("rain")).null_count() == 1);
+//! ```
+//!
+//! ```text
+//! (12, 4)
+//! shape: (4, 4)
+//! day | station | temp | rain
+//! i64 | str     | f64  | f64
+//! ----+---------+------+-----
+//!   1 | north   | 12.5 |  3.0
+//!   1 | south   | 18.0 |  0.0
+//!   1 | east    | 15.0 |  0.5
+//!   2 | north   | 13.5 |  1.5
+//! ```
+//!
+//! The header row names the columns, and each column has one type: `day`
+//! holds integers, `station` text, `temp` and `rain` floating-point
+//! numbers. The empty `rain` on day 3 is a null, a value that is not there;
+//! tables keep nulls instead of turning them into zero or NaN.
+//!
+//! ## Clean it
+//!
+//! Nulls have to go somewhere before a mean or a test. `fill_null` puts a
+//! value in their place; `drop_nulls` removes the rows that have one. Which
+//! is right depends on the data: a missing rain gauge reading is not "no
+//! rain", so this script drops the row, and shows the count either way.
+//!
+//! ```nabi
+//! let t = try table::read_csv_str("day,station,temp,rain
+//! 1,north,12.5,3.0
+//! 2,north,13.5,1.5
+//! 3,north,11.0,
+//! 4,north,12.0,6.0
+//! ");
+//! let rain = try t.column("rain");
+//! println(f"{rain.null_count()} null of {t.nrows()}");
+//!
+//! let dropped = try t.drop_nulls(["rain"]);
+//! let filled = try t.fill_null("rain", table::Value::Float(0.0));
+//! println(f"dropped: {dropped.nrows()} rows; filled: {try filled.column("rain").to_f64()}");
+//! # assert(rain.null_count() == 1 && dropped.nrows() == 3);
+//! # assert(f"{try filled.column("rain").to_f64()}" == "[3.0, 1.5, 0.0, 6.0]");
+//! ```
+//!
+//! ```text
+//! 1 null of 4
+//! dropped: 3 rows; filled: [3.0, 1.5, 0.0, 6.0]
+//! ```
+//!
+//! ## Add columns and filter rows
+//!
+//! Column expressions use the same dot operators as arrays (`.+`, `.*`,
+//! `.>` ..): `col("temp") .* 1.8 .+ 32.0` is a new column computed from
+//! `temp`, row by row. `filter` keeps the rows where a condition holds.
+//!
+//! ```nabi
+//! use table::col;
+//!
+//! let t = table::table!{
+//!     "station": ["north", "south", "east", "north", "south", "east"],
+//!     "temp":    [12.5, 18.0, 15.0, 13.5, 19.5, 14.0],
+//!     "rain":    [3.0, 0.0, 0.5, 1.5, 0.0, 2.0],
+//! };
+//! let t = try t.with_column("temp_f", col("temp") .* 1.8 .+ 32.0);
+//! let wet = try t.filter(col("rain") .> 1.0);
+//! println(wet);
+//! # assert(try wet.column("station").to_strs() == ["north", "north", "east"]);
+//! # assert(f"{try wet.column("temp_f").to_f64()}" == "[54.5, 56.3, 57.2]");
+//! ```
+//!
+//! ```text
+//! shape: (3, 4)
+//! station | temp | rain | temp_f
+//! str     | f64  | f64  | f64
+//! --------+------+------+-------
+//! north   | 12.5 |  3.0 |   54.5
+//! north   | 13.5 |  1.5 |   56.3
+//! east    | 14.0 |  2.0 |   57.2
+//! ```
+//!
+//! ## Group and summarize
+//!
+//! `group_by` collects the rows of each station; `agg` computes one value
+//! per group for each expression it is given. Aggregates are named after
+//! their column (`temp_mean`), and `.named` renames one.
+//!
+//! ```nabi
+//! use table::{desc, max, mean, sum};
+//!
+//! let t = table::table!{
+//!     "station": ["north", "south", "east", "north", "south", "east", "north", "south", "east"],
+//!     "temp":    [12.5, 18.0, 15.0, 13.5, 19.5, 14.0, 11.0, 17.5, 15.5],
+//!     "rain":    [3.0, 0.0, 0.5, 1.5, 0.0, 2.0, 0.5, 4.5, 0.0],
+//! };
+//! let by = try (try t.group_by(["station"])).agg([mean("temp"), max("temp"), sum("rain").named("total_rain")]);
+//! println(try by.sort([desc("temp_mean")]));
+//! # let s = try by.sort([desc("temp_mean")]);
+//! # assert(s.names() == ["station", "temp_mean", "temp_max", "total_rain"]);
+//! # assert(try s.column("station").to_strs() == ["south", "east", "north"]);
+//! # assert(f"{try s.column("total_rain").to_f64()}" == "[4.5, 2.5, 5.0]");
+//! ```
+//!
+//! ```text
+//! shape: (3, 4)
+//! station | temp_mean | temp_max | total_rain
+//! str     | f64       | f64      | f64
+//! --------+-----------+----------+-----------
+//! south   | 18.333333 |     19.5 |        4.5
+//! east    | 14.833333 |     15.5 |        2.5
+//! north   | 12.333333 |     13.5 |        5.0
+//! ```
+//!
+//! ## Statistics on a column
+//!
+//! A column becomes a `Vector<f64>` with `to_f64`, and from there every
+//! `stats` function applies. `stats::describe` gives the usual summary at
+//! once.
+//!
+//! ```nabi
+//! # use stats_pkg as stats;
+//! let t = table::table!{
+//!     "station": ["north", "south", "north", "south", "north", "south", "north", "south"],
+//!     "temp":    [12.5, 18.0, 13.5, 19.5, 11.0, 17.5, 12.0, 20.5],
+//! };
+//! let temp = try t.column("temp").to_f64();
+//! println(f"mean {stats::mean(temp):.2}, std {stats::std(temp, ddof: 1):.2}, median {stats::median(temp)}");
+//!
+//! let s = stats::describe(temp);
+//! println(f"n {s.n}, min {s.min}, q1 {s.q1}, q3 {s.q3}, max {s.max}");
+//! # assert(f"{stats::mean(temp):.2} {stats::std(temp, ddof: 1):.2} {stats::median(temp)}" == "15.56 3.72 15.5");
+//! # assert(f"{s.n} {s.min} {s.q1} {s.q3} {s.max}" == "8 11 12.375 18.375 20.5");
+//! ```
+//!
+//! ```text
+//! mean 15.56, std 3.72, median 15.5
+//! n 8, min 11, q1 12.375, q3 18.375, max 20.5
+//! ```
+//!
+//! `ddof: 1` asks for the sample standard deviation, dividing by `n - 1`;
+//! without it `std` divides by `n`, as NumPy does.
+//!
+//! ## Is the difference real?
+//!
+//! The south station looks warmer. A two-sample t-test asks whether a
+//! difference that large is likely if the two stations had the same mean.
+//! `stats::ttest_ind` runs Welch's test, which does not assume equal
+//! variances; the result has the statistic, the p-value and a confidence
+//! interval for the difference.
+//!
+//! ```nabi
+//! use table::col;
+//! # use stats_pkg as stats;
+//!
+//! let t = table::table!{
+//!     "station": ["north", "south", "north", "south", "north", "south", "north", "south"],
+//!     "temp":    [12.5, 18.0, 13.5, 19.5, 11.0, 17.5, 12.0, 20.5],
+//! };
+//! let north = try (try t.filter(col("station") .== "north")).column("temp").to_f64();
+//! let south = try (try t.filter(col("station") .== "south")).column("temp").to_f64();
+//!
+//! let r = try stats::ttest_ind(south, north);
+//! println(f"t = {r.statistic:.2}, p = {r.pvalue:.5}");
+//! println(f"south is warmer by {r.estimate:.2} C, 95% interval {r.ci(0.95)}");
+//! # assert(f"{r.statistic:.2} {r.pvalue:.5} {r.estimate:.2}" == "7.68 0.00036 6.62");
+//! # assert(f"{r.ci(0.95)}" == "[4.474617987003727, 8.775382012996273]");
+//! ```
+//!
+//! ```text
+//! t = 7.68, p = 0.00036
+//! south is warmer by 6.62 C, 95% interval [4.474617987003727, 8.775382012996273]
+//! ```
+//!
+//! A p-value this small says that two stations with equal means would
+//! rarely give samples this far apart. With four readings each, the
+//! interval is still wide: more data narrows it.
+//!
+//! ## Plot it
+//!
+//! `plot` builds a figure from layers with method calls, and writes SVG,
+//! PNG or text for the terminal (`ax.term()`). `scatter` and `line` take
+//! the same vectors the statistics did; `label` names a layer for the
+//! legend. `save` picks the format from the file name.
+//!
+//! ```nabi
+//! use std::{env, fs, process};
+//!
+//! let day = [1.0, 2.0, 3.0, 4.0];
+//! let north = [12.5, 13.5, 11.0, 12.0];
+//! let south = [18.0, 19.5, 17.5, 20.5];
+//!
+//! let ax = plot::axes()
+//!     .line(day, north).label("north").marker(plot::Marker::Circle)
+//!     .line(day, south).label("south").marker(plot::Marker::Circle)
+//!     .xlabel("day").ylabel("temperature [C]")
+//!     .title("Daily temperature");
+//!
+//! let path = env::temp_dir() / f"weather_{process::id()}.svg";
+//! try ax.save(path.as_str());
+//! let svg = try fs::read_to_str(path);
+//! println(f"{svg.starts_with("<svg")} {svg.contains("Daily temperature")}");
+//! try fs::remove_file(path);
+//! # assert(svg.starts_with("<svg") && svg.contains("Daily temperature"));
+//! ```
+//!
+//! ```text
+//! true true
+//! ```
+//!
+//! In a Jupyter notebook (`nabi jupyter`), a cell whose last value is a
+//! plot shows the SVG under the cell, so there is no file to write.
+//!
+//! ## What next
+//!
+//! - [Linear algebra, dense and
+//!   sparse](https://packages.nabi-lang.org/docs/linalg/latest) solves
+//!   systems and fits least squares.
+//! - [Statistics](https://packages.nabi-lang.org/docs/stats/latest) goes
+//!   further: distributions, more tests, regression.
+//! - The modules below list joins, pivots, windows, Parquet and lazy
+//!   queries.
 
 pub mod arrow;
 pub mod build;
