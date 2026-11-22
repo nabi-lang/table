@@ -2,6 +2,12 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
+## 0.1.4 (2026-11-22)
+
+- The tutorial's doc tests pass on every host: the CSV step reads text
+  in memory (no temporary file, which wasm32-wasip2 lacks), and the
+  t-test step shows its interval to two places.
+
 ## 0.1.3 (2026-11-22)
 
 - Builds in a graph that also holds the `csv` package under its own
