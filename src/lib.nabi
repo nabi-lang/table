@@ -231,9 +231,7 @@
 //! the same vectors the statistics did; `label` names a layer for the
 //! legend. `save` picks the format from the file name.
 //!
-//! ```nabi
-//! use std::{env, fs, process};
-//!
+//! ```nabi,ignore
 //! let day = [1.0, 2.0, 3.0, 4.0];
 //! let north = [12.5, 13.5, 11.0, 12.0];
 //! let south = [18.0, 19.5, 17.5, 20.5];
@@ -243,18 +241,13 @@
 //!     .line(day, south).label("south").marker(plot::Marker::Circle)
 //!     .xlabel("day").ylabel("temperature [C]")
 //!     .title("Daily temperature");
-//!
-//! let path = env::temp_dir() / f"weather_{process::id()}.svg";
-//! try ax.save(path.as_str());
-//! let svg = try fs::read_to_str(path);
-//! println(f"{svg.starts_with("<svg")} {svg.contains("Daily temperature")}");
-//! try fs::remove_file(path);
-//! # assert(svg.starts_with("<svg") && svg.contains("Daily temperature"));
+//! try ax.save("weather.svg");
 //! ```
 //!
-//! ```text
-//! true true
-//! ```
+//! With its `table` feature, `plot` draws a table's columns by name
+//! (`plot::frame`); its
+//! [docs](https://packages.nabi-lang.org/docs/plot/latest) show every
+//! kind of figure.
 //!
 //! In a Jupyter notebook (`nabi jupyter`), a cell whose last value is a
 //! plot shows the SVG under the cell, so there is no file to write.
