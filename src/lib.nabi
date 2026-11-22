@@ -290,7 +290,7 @@ mod keys;
 pub use arrow::{Arrow, arrow_schema, read_arrow, write_arrow};
 pub use build::{Record, ToValue, record_table};
 pub use column::Column;
-pub use csv::{Csv, CsvReader, read_csv, read_csv_str, write_csv};
+pub use pkg::csv::{Csv, CsvReader, read_csv, read_csv_str, write_csv};
 pub use date::{Date, DateTime};
 pub use error::TableError;
 pub use expr::{Expr, IntoExpr, Then, When, col, lit, when};
