@@ -182,7 +182,7 @@ of structs into a table with `record_table`.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/table/latest/docs
+https://docs.nabi-lang.org/packages/table/latest
 
 ## License
 
